@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "agent": "langgraph_workflow/graph_build.py:graph"
+  },
+  "env": ".env"
+}
