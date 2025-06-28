@@ -18,100 +18,88 @@ def shopify_agent_node(state):
     user_query = state.get("user_query", "")
     search_results = state.get("search_results", [])
     messages = state.get("messages", [])
+    parsed_intent = state.get("parsed_intent", {})
     
     print("🔄 Shopify Agent: Starting product publishing process...")
     
-    # Create a copy of search results to work with, don't modify the original
-    working_search_results = search_results.copy() if search_results else []
+    # Import listing database to get product details
+    from .listing_database import ListingDatabase
+    db = ListingDatabase()
     
-    # NEW: Use LLM to analyze conversation and determine which products to list
-    if working_search_results:
-        llm = ChatOpenAI(model="gpt-4o", temperature=0.1)
+    # ALWAYS check listing database first - this is the primary source
+    listing_ready_skus = db.list_products()
+    
+    if listing_ready_skus:
+        print(f"📋 Found {len(listing_ready_skus)} products in listing database - using these as primary source")
         
-        # Build conversation context
-        conversation_context = ""
-        for message in messages[:-1]:  # Exclude current message
-            if hasattr(message, 'content'):
-                role = "User" if hasattr(message, 'type') and message.type == "human" else "Assistant"
-                conversation_context += f"{role}: {message.content}\n"
+        # Get products from listing database
+        listing_products = []
+        for sku in listing_ready_skus:
+            product_data = db.get_product(sku)
+            if product_data:
+                listing_products.append(product_data)
         
-        # Get available SKUs from search results
-        available_skus = [product.get('metadata', {}).get('sku', '') for product in working_search_results]
-        available_skus = [sku for sku in available_skus if sku]  # Remove empty SKUs
-        
-        analysis_prompt = f"""
-You are helping a user list products on Shopify. Analyze the conversation and determine which products they want to list.
-
-CONVERSATION HISTORY:
-{conversation_context}
-
-CURRENT USER QUERY:
-{user_query}
-
-AVAILABLE PRODUCTS (SKUs):
-{available_skus}
-
-TASK: Determine which products the user wants to list on Shopify.
-
-Look for:
-- If they mention specific products (like "these two", "both", "the ones mentioned")
-- If they refer to products by SKU
-- If they want to list all available products
-- The language they're using (Chinese or English only)
-
-Return a JSON object:
-{{
-    "skus_to_list": ["SKU1", "SKU2", ...],
-    "language": "detected_language",
-    "reasoning": "explanation of your decision"
-}}
-
-If they want specific products, list only those SKUs. If they want all products, list all available SKUs.
-If no specific products mentioned, default to listing all available products.
-
-Language detection: Only support "zh-cn" for Chinese or "en" for English.
-
-Return ONLY valid JSON.
-"""
-        
-        try:
-            analysis_response = llm.invoke(analysis_prompt)
-            content = analysis_response.content.strip()
-            if content.startswith('```json'):
-                content = content[7:]
-            if content.endswith('```'):
-                content = content[:-3]
-            content = content.strip()
-            
-            analysis_result = json.loads(content)
-            skus_to_list = analysis_result.get("skus_to_list", [])
-            language = analysis_result.get("language", "en")
-            reasoning = analysis_result.get("reasoning", "")
-            
-            print(f"🔍 LLM Analysis: {reasoning}")
-            print(f"🎯 SKUs to list: {skus_to_list}")
-            print(f"🌐 Language: {language}")
-            
-            # Filter products based on LLM analysis
-            if skus_to_list:
-                filtered_results = []
-                for product in working_search_results:
-                    sku = product.get('metadata', {}).get('sku', '')
-                    if sku in skus_to_list:
-                        filtered_results.append(product)
+        if listing_products:
+            print(f"✅ Using {len(listing_products)} products from listing database")
+            # Use listing database products as primary source
+            working_search_results = []
+            for listing_product in listing_products:
+                # Create a mock search result from listing database entry
+                original_metadata = listing_product.get('original_metadata', {})
+                # Update the main image to the modified image (if it exists)
+                modified_image_url = listing_product.get('modified_image_url', '')
+                if modified_image_url:
+                    original_metadata['main_image_url'] = modified_image_url
+                    # Add the modified image to the image_urls list at the beginning
+                    image_urls = original_metadata.get('image_urls', [])
+                    if modified_image_url not in image_urls:
+                        image_urls.insert(0, modified_image_url)
+                        original_metadata['image_urls'] = image_urls
                 
-                if filtered_results:
-                    working_search_results = filtered_results
-                    print(f"✅ Filtered to {len(filtered_results)} products: {skus_to_list}")
-                else:
-                    print(f"⚠️ No matching products found for SKUs: {skus_to_list}")
+                working_search_results.append({
+                    'metadata': original_metadata,
+                    'id': f"{listing_product.get('sku')}_listing",
+                    'score': 1.0
+                })
+        else:
+            print("⚠️ No valid products found in listing database, falling back to search results")
+            working_search_results = search_results.copy() if search_results else []
+    else:
+        print("📋 No products in listing database, using search results as fallback")
+        # Create a copy of search results to work with, don't modify the original
+        working_search_results = search_results.copy() if search_results else []
+    
+    # Use parsed intent to determine which products to list
+    if working_search_results and parsed_intent:
+        selected_products = parsed_intent.get("selected_products", [])
+        selected_skus = parsed_intent.get("selected_skus", [])
+        reasoning = parsed_intent.get("reasoning", "")
+        confidence = parsed_intent.get("confidence", 0.0)
+        language = parsed_intent.get("language", "en")
+        
+        print(f"🔍 Intent Parser Results: {reasoning}")
+        print(f"🎯 Selected SKUs: {selected_skus}")
+        print(f"📊 Confidence: {confidence}")
+        print(f"🌐 Language: {language}")
+        
+        # Filter products based on intent parser results
+        if selected_skus:
+            filtered_results = []
+            for product in working_search_results:
+                sku = product.get('metadata', {}).get('sku', '')
+                if sku in selected_skus:
+                    filtered_results.append(product)
+            
+            if filtered_results:
+                working_search_results = filtered_results
+                print(f"✅ Filtered to {len(filtered_results)} products: {selected_skus}")
             else:
-                print("🔍 No specific SKUs identified, using all available products")
-                
-        except Exception as e:
-            print(f"⚠️ LLM analysis failed: {e}")
-            print("🔍 Using all available products as fallback")
-            language = "en"
+                print(f"⚠️ No matching products found for SKUs: {selected_skus}")
+        else:
+            print("🔍 No specific SKUs identified, using all available products")
+    else:
+        print("🔍 No intent parser results available, using all available products")
+        language = "en"
     
     if not working_search_results:
         return {
@@ -195,7 +183,8 @@ Description:"""
             
             # Create product input with AI-generated content
             product_input = create_product_input_from_metadata(metadata, ai_title, ai_description)
-            media = create_media_from_metadata(metadata)
+            # NEW: Pass modified_images to create_media_from_metadata
+            media = create_media_from_metadata(metadata, [])
             result = publish_product_to_shopify(product_input, media, metadata)
             if result.get('success'):
                 successful_products.append(result)
@@ -436,24 +425,44 @@ def create_specifications_table(specs: Dict[str, str]) -> str:
     </div>
     '''
 
-def create_media_from_metadata(metadata: Dict[str, Any]) -> List[Dict[str, str]]:
-    """Create media array from metadata"""
+def create_media_from_metadata(metadata: Dict[str, Any], modified_images: List[Dict] = None) -> List[Dict[str, str]]:
+    """Create media array from metadata, including modified images if available"""
     media = []
     
     # Get all images from the new structure
     image_urls = metadata.get('image_urls', [])
     main_image_url = metadata.get('main_image_url', '')
+    sku = metadata.get('sku', '')
     
-    # If we have the image_urls array, use all images
+    # NEW: Check if we have modified images for this SKU
+    modified_image_url = None
+    if modified_images:
+        for img_result in modified_images:
+            if img_result.get('sku') == sku and img_result.get('status') == 'success':
+                modified_image_url = img_result.get('modified_image_url')
+                break
+    
+    # If we have a modified image, use it as the main image
+    if modified_image_url:
+        media.append({
+            "originalSource": modified_image_url,
+            "mediaContentType": "IMAGE"
+        })
+        print(f"🎨 Shopify Agent: Using modified image for SKU {sku}: {modified_image_url}")
+    
+    # Add original images (but skip the main one if we're using a modified version)
     if image_urls:
         for img_url in image_urls:
             if img_url and img_url.strip():
+                # Skip the main image if we're using a modified version
+                if modified_image_url and img_url.strip() == main_image_url:
+                    continue
                 media.append({
                     "originalSource": img_url.strip(),
                     "mediaContentType": "IMAGE"
                 })
-    # Fallback to main_image_url if image_urls is not available
-    elif main_image_url:
+    # Fallback to main_image_url if image_urls is not available and no modified image
+    elif main_image_url and not modified_image_url:
         media.append({
             "originalSource": main_image_url,
             "mediaContentType": "IMAGE"

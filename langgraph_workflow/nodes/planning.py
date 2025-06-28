@@ -1,6 +1,7 @@
 from langchain_community.chat_models import ChatOpenAI
 from langchain_core.messages import HumanMessage
 import json
+import re
 
 def planning_node(state):
     user_query = state["messages"][-1].content
@@ -12,35 +13,75 @@ def planning_node(state):
     print(f"🔍 Debug - Search results length: {len(search_results) if search_results else 0}")
     print(f"🔍 Debug - Search results content: {search_results[:2] if search_results else 'None'}")
     
-    # CRITICAL FIX: If we have search results and this is a search query, 
-    # route to gpt4_chat to generate a response instead of going back to search
-    if search_results and any(keyword in user_query.lower() for keyword in ['find', 'search', 'recommend', 'show me', 'get me']):
-        print(f"[Planning Node] Search results found ({len(search_results)} items), routing to gpt4_chat to generate response")
-        state["plan_action"] = "gpt4_chat"
-        return state
+    # NEW: Check for compound requests (confirmation + new modification)
+    compound_confirmation_keywords = [
+        'this one is good', 'keep it', 'yes', 'incorporate', 'use it', 'save it',
+        'good', 'perfect', 'nice', 'great', 'awesome', 'love it'
+    ]
     
-    # NEW FIX: If user mentions a specific SKU and we have search results, route directly to shopify_agent
-    # This prevents the filter node from being called and potentially losing products
-    if search_results:
-        # Check if user mentioned a specific SKU
-        sku_mentioned = None
-        for product in search_results:
-            sku = product.get('metadata', {}).get('sku', '')
-            if sku and sku.lower() in user_query.lower():
-                sku_mentioned = sku
+    compound_modification_keywords = [
+        'make another', 'create another', 'do another', 'modify another', 'change another',
+        'and i want', 'also want', 'also make', 'also create', 'also modify',
+        'next one', 'another one', 'different style', 'different scene'
+    ]
+    
+    # Check if this is a compound request
+    is_compound_confirmation = any(keyword in user_query.lower() for keyword in compound_confirmation_keywords)
+    is_compound_modification = any(keyword in user_query.lower() for keyword in compound_modification_keywords)
+    
+    if is_compound_confirmation and is_compound_modification and state.get("awaiting_confirmation", False):
+        print(f"[Planning Node] Compound request detected: confirmation + new modification")
+        print(f"[Planning Node] User query: '{user_query}'")
+        
+        # Extract the new modification instruction
+        # Look for patterns like "and i want to make another one, [instruction]"
+        modification_patterns = [
+            r'and i want to make another one[,\s]+(.+)',
+            r'also want to make another[,\s]+(.+)',
+            r'make another one[,\s]+(.+)',
+            r'create another[,\s]+(.+)',
+            r'do another[,\s]+(.+)',
+            r'and i want[,\s]+(.+)',
+            r'also want[,\s]+(.+)'
+        ]
+        
+        new_instruction = None
+        for pattern in modification_patterns:
+            match = re.search(pattern, user_query, re.IGNORECASE)
+            if match:
+                new_instruction = match.group(1).strip()
                 break
         
-        # Check if user wants to list/publish products
-        listing_keywords = ['list', 'publish', 'push', 'upload', 'make live', 'put on shopify', 'add to shopify']
-        if any(keyword in user_query.lower() for keyword in listing_keywords):
-            if sku_mentioned:
-                print(f"[Planning Node] User mentioned specific SKU {sku_mentioned} and wants to list, routing directly to shopify_agent")
-                state["plan_action"] = "shopify_agent"
-                return state
-            else:
-                print(f"[Planning Node] User wants to list products but no specific SKU mentioned, routing to shopify_agent")
-                state["plan_action"] = "shopify_agent"
-                return state
+        if new_instruction:
+            print(f"[Planning Node] Extracted new instruction: '{new_instruction}'")
+            
+            # Set up the new image modification request
+            state["image_modification_request"] = {
+                "instruction": new_instruction,
+                "image_url": None  # Will be resolved in image_agent
+            }
+            state["plan_action"] = "image_agent"
+            state["action_type"] = "image_modification"
+            
+            # Also mark that we should incorporate the previous modification
+            state["incorporate_previous"] = True
+            
+            return state
+    
+    # NEW: Check for listing database operations
+    listing_db_keywords = [
+        'yes', 'yes, incorporate it', 'incorporate', 'add it', 'save it', 'use it',
+        'no', 'no, keep original', 'discard', 'don\'t use', 'keep original',
+        'view all listing', 'show listing', 'list ready', 'remove'
+    ]
+    
+    # Check if user is responding to image modification confirmation
+    is_listing_db_operation = any(keyword in user_query.lower() for keyword in listing_db_keywords)
+    
+    if is_listing_db_operation and state.get("awaiting_confirmation", False):
+        print(f"[Planning Node] Listing database operation detected: '{user_query}'")
+        state["plan_action"] = "listing_database"
+        return state
     
     # Build full conversation history
     history = "\n".join([
@@ -54,7 +95,7 @@ def planning_node(state):
     
     llm = ChatOpenAI(model="gpt-4o", temperature=0.1, request_timeout=10)
     
-    prompt = f"""You are an intelligent conversation router for an AI assistant. Your job is to analyze the conversation context and user intent to decide the best action.
+    prompt = f"""You are a conversation router. Analyze the user's intent and route to the appropriate action.
 
 CONVERSATION HISTORY:
 {history}
@@ -65,56 +106,19 @@ PREVIOUSLY FOUND PRODUCTS:
 USER'S LATEST QUERY:
 {user_query}
 
-ANALYSIS TASK:
-1. First, understand what the user is asking for by analyzing their query in context
-2. Consider the conversation history - what have we discussed before?
-3. Look at previously found products - are they relevant to this query?
-4. Determine the user's intent: Are they asking for new information, referencing previous results, having a general conversation, or wanting to publish products to Shopify?
-
 AVAILABLE ACTIONS:
-1. "gpt4_chat" - Use for general conversation, questions, analysis, explanations, jokes, casual chat, or any non-product-related queries. This includes analyzing previously found products and general business discussions.
-2. "decide_search_strategy" - Use when user asks to find, search, or recommend products/items/SKUs.
-3. "shopify_agent" - Use when user wants to publish products to Shopify. This includes phrases like "push to shopify", "publish these", "make them live", "list on shopify", "put them on shopify", etc.
+1. "gpt4_chat" - General conversation, analysis, questions
+2. "decide_search_strategy" - Find/search for products
+3. "shopify_agent" - Publish products to Shopify
+4. "image_agent" - Modify product images (background changes, style transformations, etc.)
 
 ROUTING RULES:
-- Use "decide_search_strategy" when user wants to find products (any product search request)
-- Use "shopify_agent" when user wants to publish existing products to Shopify (requires search_results to exist)
-- Use "gpt4_chat" when user asks about previously found products or general analysis
-- Use "gpt4_chat" for general conversation, market analysis, business advice
-- Be smart about intent - if user wants products, route to search; if they want to publish, route to shopify
+- Use "decify_search_strategy" for product search requests
+- Use "shopify_agent" for publishing to Shopify (requires search_results)
+- Use "image_agent" for image modifications (requires search_results)
+- Use "gpt4_chat" for everything else
 
-SHOPIFY PUBLISHING TRIGGERS:
-- "push these to shopify"
-- "publish these products"
-- "make them live"
-- "list on shopify"
-- "put them on shopify"
-- "upload to shopify"
-- "publish to shopify"
-- "go live with these"
-- "make them available on shopify"
-
-EXAMPLES:
-- "Hello" → gpt4_chat
-- "How are you?" → gpt4_chat  
-- "Tell me a joke" → gpt4_chat
-- "Analyze the market" → gpt4_chat
-- "Find products for coffee shop" → decide_search_strategy
-- "Find products suitable for outdoor spaces" → decide_search_strategy
-- "Recommend items" → decide_search_strategy
-- "Search for furniture" → decide_search_strategy
-- "Tell me about those products" → gpt4_chat (analyzing previous products)
-- "How do these items perform?" → gpt4_chat (analyzing previous products)
-- "What's the market demand for these?" → gpt4_chat (analyzing previous products)
-- "Give me business advice" → gpt4_chat (general business discussion)
-- "Push these to Shopify" → shopify_agent
-- "Publish these products" → shopify_agent
-- "Make them live on Shopify" → shopify_agent
-- "List these on Shopify" → shopify_agent
-
-IMPORTANT: Only route to "shopify_agent" if there are search_results available (products found from previous searches).
-
-Respond with ONLY the JSON: {{"action": "action_name"}}"""
+Respond with ONLY: {{"action": "action_name"}}"""
 
     response = llm.invoke(prompt)
     
@@ -157,6 +161,25 @@ Respond with ONLY the JSON: {{"action": "action_name"}}"""
         else:
             print(f"[Planning Node] Found {len(search_results)} search results, proceeding to shopify_agent")
             state["plan_action"] = "shopify_agent"
+            # Set action type for intent parser
+            state["action_type"] = "shopify_listing"
+    elif action == "image_agent":
+        # Check if we have search results before allowing image modification
+        if not search_results:
+            print("[Planning Node] No search results found, redirecting to gpt4_chat for image modification request")
+            state["plan_action"] = "gpt4_chat"
+        else:
+            print(f"[Planning Node] Found {len(search_results)} search results, proceeding to image_agent")
+            state["plan_action"] = "image_agent"
+            # Set up image modification request
+            state["image_modification_request"] = {
+                "instruction": user_query,
+                "image_url": None  # Will be resolved in image_agent
+            }
+            # Set action type for intent parser
+            state["action_type"] = "image_modification"
+            print(f"[Planning Node] Set image_modification_request: {state['image_modification_request']}")
+            print(f"[Planning Node] Set plan_action: {state['plan_action']}")
     else:
         state["plan_action"] = "decide_search_strategy"
     

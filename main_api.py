@@ -56,7 +56,7 @@ print("OPENAI_API_KEY loaded:", os.getenv("OPENAI_API_KEY"))
 os.environ["OPENAI_API_KEY"] = config.OPENAI_API_KEY
 
 # In-memory session store (for dev)
-# session_store = {}
+session_store = {}
 GLOBAL_STATE = None
 
 class Message(BaseModel):
@@ -83,6 +83,22 @@ async def chat(request: Request):
         "language": "en",
         "use_metadata_filter": False,
         "metadata_filters": {},
+        # NEW FIELDS FOR SHOPIFY AGENT
+        "shopify_products": [],
+        "shopify_status": {},
+        # NEW FIELDS FOR IMAGE AGENT
+        "image_modification_request": {},
+        "modified_images": [],
+        "image_agent_response": "",
+        "awaiting_confirmation": False,
+        # NEW FIELDS FOR LISTING DATABASE
+        "listing_database_response": "",
+        "listing_ready_products": [],
+        # NEW FIELDS FOR INTENT PARSER
+        "parsed_intent": {},
+        "action_type": "general",
+        # NEW FIELD FOR COMPOUND REQUESTS
+        "incorporate_previous": False,
     }
     # Run the graph
     result = graph.invoke(state, config={"configurable": {"thread_id": session_id}})
@@ -102,7 +118,23 @@ async def chat_endpoint(request: Request):
             "user_query": "",
             "search_queries": [],
             "search_results": [],
-            "final_summary": ""
+            "final_summary": "",
+            # NEW FIELDS FOR SHOPIFY AGENT
+            "shopify_products": [],
+            "shopify_status": {},
+            # NEW FIELDS FOR IMAGE AGENT
+            "image_modification_request": {},
+            "modified_images": [],
+            "image_agent_response": "",
+            "awaiting_confirmation": False,
+            # NEW FIELDS FOR LISTING DATABASE
+            "listing_database_response": "",
+            "listing_ready_products": [],
+            # NEW FIELDS FOR INTENT PARSER
+            "parsed_intent": {},
+            "action_type": "general",
+            # NEW FIELD FOR COMPOUND REQUESTS
+            "incorporate_previous": False,
         }
     state = GLOBAL_STATE
     state["messages"].append(HumanMessage(content=user_query))
@@ -143,7 +175,7 @@ async def chat_endpoint(request: Request):
 async def info():
     return {
         "name": "My LangGraph Agent",
-        "description": "A LangGraph-powered assistant.",
+        "description": "A LangGraph-powered assistant with image modification and intent parsing capabilities.",
         "version": "1.0.0"
     }
 
