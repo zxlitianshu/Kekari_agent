@@ -24,34 +24,101 @@ def shopify_agent_node(state):
     # Create a copy of search results to work with, don't modify the original
     working_search_results = search_results.copy() if search_results else []
     
-    # NEW: Check if user mentioned a specific SKU and filter to that product
+    # NEW: Use LLM to analyze conversation and determine which products to list
     if working_search_results:
-        sku_mentioned = None
-        for product in working_search_results:
-            sku = product.get('metadata', {}).get('sku', '')
-            if sku and sku.lower() in user_query.lower():
-                sku_mentioned = sku
-                break
+        llm = ChatOpenAI(model="gpt-4o", temperature=0.1)
         
-        if sku_mentioned:
-            print(f"🎯 User mentioned specific SKU: {sku_mentioned}, filtering to that product only")
-            filtered_results = []
-            for product in working_search_results:
-                if product.get('metadata', {}).get('sku', '').lower() == sku_mentioned.lower():
-                    filtered_results.append(product)
-                    break
-            if filtered_results:
-                working_search_results = filtered_results
-                print(f"✅ Filtered to specific product: {sku_mentioned}")
+        # Build conversation context
+        conversation_context = ""
+        for message in messages[:-1]:  # Exclude current message
+            if hasattr(message, 'content'):
+                role = "User" if hasattr(message, 'type') and message.type == "human" else "Assistant"
+                conversation_context += f"{role}: {message.content}\n"
+        
+        # Get available SKUs from search results
+        available_skus = [product.get('metadata', {}).get('sku', '') for product in working_search_results]
+        available_skus = [sku for sku in available_skus if sku]  # Remove empty SKUs
+        
+        analysis_prompt = f"""
+You are helping a user list products on Shopify. Analyze the conversation and determine which products they want to list.
+
+CONVERSATION HISTORY:
+{conversation_context}
+
+CURRENT USER QUERY:
+{user_query}
+
+AVAILABLE PRODUCTS (SKUs):
+{available_skus}
+
+TASK: Determine which products the user wants to list on Shopify.
+
+Look for:
+- If they mention specific products (like "these two", "both", "the ones mentioned")
+- If they refer to products by SKU
+- If they want to list all available products
+- The language they're using (Chinese or English only)
+
+Return a JSON object:
+{{
+    "skus_to_list": ["SKU1", "SKU2", ...],
+    "language": "detected_language",
+    "reasoning": "explanation of your decision"
+}}
+
+If they want specific products, list only those SKUs. If they want all products, list all available SKUs.
+If no specific products mentioned, default to listing all available products.
+
+Language detection: Only support "zh-cn" for Chinese or "en" for English.
+
+Return ONLY valid JSON.
+"""
+        
+        try:
+            analysis_response = llm.invoke(analysis_prompt)
+            content = analysis_response.content.strip()
+            if content.startswith('```json'):
+                content = content[7:]
+            if content.endswith('```'):
+                content = content[:-3]
+            content = content.strip()
+            
+            analysis_result = json.loads(content)
+            skus_to_list = analysis_result.get("skus_to_list", [])
+            language = analysis_result.get("language", "en")
+            reasoning = analysis_result.get("reasoning", "")
+            
+            print(f"🔍 LLM Analysis: {reasoning}")
+            print(f"🎯 SKUs to list: {skus_to_list}")
+            print(f"🌐 Language: {language}")
+            
+            # Filter products based on LLM analysis
+            if skus_to_list:
+                filtered_results = []
+                for product in working_search_results:
+                    sku = product.get('metadata', {}).get('sku', '')
+                    if sku in skus_to_list:
+                        filtered_results.append(product)
+                
+                if filtered_results:
+                    working_search_results = filtered_results
+                    print(f"✅ Filtered to {len(filtered_results)} products: {skus_to_list}")
+                else:
+                    print(f"⚠️ No matching products found for SKUs: {skus_to_list}")
             else:
-                print(f"⚠️ SKU {sku_mentioned} not found in search results, using all products")
+                print("🔍 No specific SKUs identified, using all available products")
+                
+        except Exception as e:
+            print(f"⚠️ LLM analysis failed: {e}")
+            print("🔍 Using all available products as fallback")
+            language = "en"
     
     if not working_search_results:
         return {
             "messages": [HumanMessage(content="❌ No products found to publish to Shopify.")],
             **state
         }
-    print(f"📦 Found {len(working_search_results)} products to process for Shopify\n")
+    print(f"🔍 Found {len(working_search_results)} products to process for Shopify\n")
 
     # Deduplicate by SKU
     unique_products = {}
@@ -69,7 +136,65 @@ def shopify_agent_node(state):
         metadata = match.get('metadata', {})
         print(f"🔄 Processing product {idx}/{len(unique_products)}: {sku}")
         try:
-            product_input = create_product_input_from_metadata(metadata)
+            # NEW: Generate AI-written title and description
+            llm = ChatOpenAI(model="gpt-4o", temperature=0.7, request_timeout=15)
+            
+            # Prepare product data for LLM
+            product_data = f"""
+SKU: {metadata.get('sku', 'N/A')}
+Category: {metadata.get('category', 'N/A')}
+Material: {metadata.get('material', 'N/A')}
+Color: {metadata.get('color', 'N/A')}
+Features: {metadata.get('characteristics_text', 'N/A')}
+Dimensions: Height: {metadata.get('height', 'N/A')}", Width: {metadata.get('width', 'N/A')}", Length: {metadata.get('length', 'N/A')}"
+Weight: {metadata.get('weight', 'N/A')} lbs
+Scene: {metadata.get('scene', 'N/A')}
+"""
+            
+            # Generate title
+            title_prompt = f"""
+Create a compelling, SEO-friendly product title for this item. Make it attractive and descriptive.
+
+Product Information:
+{product_data}
+
+Requirements:
+- Keep it under 100 characters
+- Include key features like material, color, or type
+- Make it appealing to customers
+- Don't include SKU in the title
+- Be specific and descriptive
+
+Title:"""
+            
+            title_response = llm.invoke(title_prompt)
+            ai_title = title_response.content.strip().strip('"').strip("'")
+            
+            # Generate description
+            desc_prompt = f"""
+Create a compelling product description for this item. Make it engaging and informative.
+
+Product Information:
+{product_data}
+
+Requirements:
+- Write 2-3 paragraphs
+- Highlight key features and benefits
+- Make it appealing to customers
+- Include practical use cases
+- Be enthusiastic but professional
+- Don't include SKU in the description
+
+Description:"""
+            
+            desc_response = llm.invoke(desc_prompt)
+            ai_description = desc_response.content.strip()
+            
+            print(f"🤖 Generated AI Title: {ai_title}")
+            print(f"🤖 Generated AI Description: {ai_description[:100]}...")
+            
+            # Create product input with AI-generated content
+            product_input = create_product_input_from_metadata(metadata, ai_title, ai_description)
             media = create_media_from_metadata(metadata)
             result = publish_product_to_shopify(product_input, media, metadata)
             if result.get('success'):
@@ -77,7 +202,7 @@ def shopify_agent_node(state):
                 print(f"✅ Successfully published: {result.get('title', sku)}\n")
                 # After publishing each product, collect the Shopify product link and title
                 shopify_url = result.get('live_url') or result.get('shopify_url') or result.get('url')
-                title = result.get('title', metadata.get('name', 'Your Product'))
+                title = result.get('title', ai_title)
                 if shopify_url:
                     product_links.append({'title': title, 'url': shopify_url})
                     print(f"🔗 Added product link: {title} -> {shopify_url}")
@@ -97,33 +222,12 @@ def shopify_agent_node(state):
         llm = ChatOpenAI(model="gpt-4o", temperature=0.3, request_timeout=10)
         links_str = "\n".join([f"- {p['title']}: {p['url']}" for p in product_links])
         
-        # Detect user language from the query
-        user_language = "en"  # default
-        if any(char in user_query for char in ['的', '这', '那', '是', '有', '在', '到', '上', '下']):
-            user_language = "zh"
-        elif any(char in user_query for char in ['の', 'は', 'が', 'を', 'に', 'へ', 'で']):
-            user_language = "ja"
-        elif any(char in user_query for char in ['의', '이', '가', '을', '를', '에', '로']):
-            user_language = "ko"
-        
         # Generate language-appropriate prompt
-        if user_language == "zh":
+        if language == "zh" or language == "zh-cn":
             prompt = f"""
 你刚刚帮助用户将产品上架到Shopify。以下是产品标题和链接：
 {links_str}
 用中文写一个友好的祝贺消息给用户，列出每个产品及其标题和链接。要简洁且热情。
-"""
-        elif user_language == "ja":
-            prompt = f"""
-あなたはユーザーがShopifyに商品を出品するのを手伝いました。以下が商品タイトルとリンクです：
-{links_str}
-日本語でユーザーへの親しみやすいお祝いメッセージを書き、各商品のタイトルとリンクを記載してください。簡潔で熱意のある内容にしてください。
-"""
-        elif user_language == "ko":
-            prompt = f"""
-사용자가 Shopify에 제품을 등록하는 것을 도왔습니다. 다음은 제품 제목과 링크입니다:
-{links_str}
-한국어로 사용자에게 친근한 축하 메시지를 작성하고, 각 제품의 제목과 링크를 나열하세요. 간결하고 열정적으로 작성하세요.
 """
         else:
             prompt = f"""
@@ -143,21 +247,8 @@ Write a friendly, congratulatory message to the user, listing each product with 
         return state
     
     # If no products were successfully published, return failure message
-    # Detect user language for failure message too
-    user_language = "en"  # default
-    if any(char in user_query for char in ['的', '这', '那', '是', '有', '在', '到', '上', '下']):
-        user_language = "zh"
-    elif any(char in user_query for char in ['の', 'は', 'が', 'を', 'に', 'へ', 'で']):
-        user_language = "ja"
-    elif any(char in user_query for char in ['의', '이', '가', '을', '를', '에', '로']):
-        user_language = "ko"
-    
-    if user_language == "zh":
+    if language == "zh" or language == "zh-cn":
         success_message = "❌ 没有产品成功上架到Shopify。"
-    elif user_language == "ja":
-        success_message = "❌ Shopifyに商品が正常に出品されませんでした。"
-    elif user_language == "ko":
-        success_message = "❌ Shopify에 제품이 성공적으로 등록되지 않았습니다."
     else:
         success_message = "❌ No products were successfully published to Shopify."
     
@@ -169,13 +260,52 @@ Write a friendly, congratulatory message to the user, listing each product with 
         print(f"{i}: {getattr(m, 'content', m)} (type: {getattr(m, 'type', None)}, role: {getattr(m, 'role', None)})")
     return state
 
-def create_product_input_from_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
+def create_product_input_from_metadata(metadata: Dict[str, Any], ai_title: str, ai_description: str) -> Dict[str, Any]:
     """Create Shopify product input from vector search metadata"""
     
-    # Extract basic info
-    title = metadata.get('name', metadata.get('title', 'Product'))
+    # Use AI-generated title and description
+    title = ai_title if ai_title else "Product"
+    description = ai_description if ai_description else ""
+    
+    # Create HTML description with AI-generated content
+    description_html = create_description_html(metadata, ai_description)
+    
+    return {
+        "title": title,
+        "descriptionHtml": description_html,
+        "productType": metadata.get('category', 'General'),
+        "vendor": metadata.get('vendor', 'Default Vendor'),
+        "status": "ACTIVE"
+    }
+
+    # Add category if available
+    category = metadata.get('category', '')
+    if category:
+        title_parts.append(category)
+    
+    # Add material if available
+    material = metadata.get('material', '')
+    if material:
+        title_parts.append(material)
+    
+    # Add color if available
+    color = metadata.get('color', '')
+    if color:
+        title_parts.append(color)
+    
+    # Add SKU if available
     sku = metadata.get('sku', '')
-    description = metadata.get('description', '')
+    if sku:
+        title_parts.append(f"({sku})")
+    
+    # Create title
+    if title_parts:
+        title = " ".join(title_parts)
+    else:
+        title = f"Product {sku}" if sku else "Product"
+    
+    # Create description from characteristics_text if available
+    description = metadata.get('characteristics_text', metadata.get('description', ''))
     
     # Create HTML description if we have structured data
     description_html = create_description_html(metadata)
@@ -188,7 +318,7 @@ def create_product_input_from_metadata(metadata: Dict[str, Any]) -> Dict[str, An
         "status": "ACTIVE"
     }
 
-def create_description_html(metadata: Dict[str, Any]) -> str:
+def create_description_html(metadata: Dict[str, Any], ai_description: str = "") -> str:
     """Create rich HTML description from metadata"""
     
     # Start with basic description
@@ -228,13 +358,22 @@ def create_description_html(metadata: Dict[str, Any]) -> str:
     elif main_image_url:
         html_parts.append(f'<div><img src="{main_image_url}" alt="Product Image" style="width: 100%;display:block; margin-top:24px;"></div>')
     
-    # Add product description
-    description = metadata.get('description', '')
-    if description:
+    # Add AI-generated description first
+    if ai_description:
         html_parts.append(f'''
         <div style="width:100%; margin-top:24px;">
         <div style="font-size: 16px; font-weight:bold;line-height:24px;color: #333333;word-break: break-word;">Product Description:</div>
-        <div style="margin-top:12px;word-break: break-word;white-space:pre-line;line-height:18px;">{description}</div>
+        <div style="margin-top:12px;word-break: break-word;white-space:pre-line;line-height:18px;">{ai_description}</div>
+        </div>
+        ''')
+    
+    # Add original characteristics_text as additional details if different from AI description
+    original_description = metadata.get('characteristics_text', metadata.get('description', ''))
+    if original_description and original_description != ai_description:
+        html_parts.append(f'''
+        <div style="width:100%; margin-top:24px;">
+        <div style="font-size: 16px; font-weight:bold;line-height:24px;color: #333333;word-break: break-word;">Product Specifications:</div>
+        <div style="margin-top:12px;word-break: break-word;white-space:pre-line;line-height:18px;">{original_description}</div>
         </div>
         ''')
     

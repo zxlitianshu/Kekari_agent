@@ -153,7 +153,7 @@ def list_models():
         "object": "list",
         "data": [
             {
-                "id": "2025agent",
+                "id": "Homywork v3.5 大模型",
                 "object": "model",
                 "created": 0,
                 "owned_by": "you"

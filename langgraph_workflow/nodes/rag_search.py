@@ -54,7 +54,7 @@ def rag_search_node(state):
     
     print(f"✅ RAG pipeline completed, returning search results... (took {time.time() - start_time:.2f}s)")
     
-    # Update state with search results only - no verbose summary message
+    # Update state with search results
     return {
         "user_query": user_query,
         "search_queries": search_queries,

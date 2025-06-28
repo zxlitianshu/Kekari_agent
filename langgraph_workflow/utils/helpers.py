@@ -53,8 +53,29 @@ def pinecone_search(query, top_k=3, filter=None):
 # Helper: Detect language
 def detect_language(text):
     try:
-        return detect(text)
-    except Exception:
+        lang_code = detect(text)
+        print(f"🔍 Language detection result: {lang_code} for text: {text[:50]}...")
+        
+        # Map language codes to our supported languages (Chinese and English only)
+        if lang_code in ['zh', 'zh-cn', 'zh-tw', 'zh-hk']:
+            final_lang = 'zh-cn'
+            print(f"✅ Mapped {lang_code} to {final_lang}")
+            return final_lang
+        elif lang_code in ['en', 'en-us', 'en-gb']:
+            final_lang = 'en'
+            print(f"✅ Mapped {lang_code} to {final_lang}")
+            return final_lang
+        else:
+            # For any other language, default to English
+            print(f"⚠️ Unknown language code {lang_code}, defaulting to English")
+            return 'en'
+    except Exception as e:
+        print(f"⚠️ Language detection failed: {e}")
+        # Fallback: check for Chinese characters
+        if any('\u4e00' <= char <= '\u9fff' for char in text):
+            print(f"✅ Fallback: Detected Chinese characters, returning zh-cn")
+            return 'zh-cn'
+        print(f"⚠️ Fallback: No Chinese characters detected, returning en")
         return "en"
 
 def slim_product(product):

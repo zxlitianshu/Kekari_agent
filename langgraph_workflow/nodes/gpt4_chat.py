@@ -1,10 +1,21 @@
 from langchain_community.chat_models import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage
+from langgraph_workflow.utils.helpers import detect_language
 
 def gpt4_chat_node(state):
     user_query = state["messages"][-1].content
     messages = state.get("messages", [])
     search_results = state.get("search_results", [])
+    language = state.get("language", "en")  # Get language from state
+    
+    print(f"🔍 GPT Chat Node - Language from state: {language}")
+    
+    # Fallback: detect language if not in state
+    if language == "en":
+        print(f"🔍 GPT Chat Node - Language was 'en', detecting from user query...")
+        language = detect_language(user_query)
+    
+    print(f"🌐 GPT Chat Node - Final detected language: {language}")
     
     # Build conversation history - include all previous messages in this conversation
     history_messages = []
@@ -58,8 +69,8 @@ def gpt4_chat_node(state):
     else:
         print("🔍 Debug - No search_results found")
     
-    # Create comprehensive prompt
-    prompt = f"""You are a helpful AI assistant. Answer the user's current question directly, confidently, and naturally.
+    # Create comprehensive prompt with language-specific instructions
+    base_prompt = f"""You are a helpful AI assistant. Answer the user's current question directly, confidently, and naturally.
 
 CONVERSATION HISTORY:
 {history if history else "No previous conversation history."}
@@ -98,6 +109,12 @@ INSTRUCTIONS:
 - When describing products, be comprehensive and mention ALL relevant details from the metadata, including construction materials, features, and specifications.
 
 Please respond to the user's query using ONLY the information provided above:"""
+
+    # Add language-specific instruction
+    if language == "zh-cn":
+        prompt = base_prompt + "\n\nIMPORTANT: Respond in Chinese (中文)."
+    else:
+        prompt = base_prompt + "\n\nIMPORTANT: Respond in English."
 
     llm = ChatOpenAI(model="gpt-4o", temperature=0.3)
     response = llm.invoke(prompt)
