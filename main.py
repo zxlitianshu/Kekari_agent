@@ -27,27 +27,48 @@ def chat(session_id=None):
         print(f"[Session ID: {session_id}]")
     else:
         print(f"[Using Session ID: {session_id}]")
-    messages = []
+    
+    # Initialize state once, outside the loop
+    state = {
+        "messages": [],
+        "user_query": "",
+        "search_queries": [],
+        "search_results": [],
+        "final_summary": ""
+    }
+    
     while True:
         user_query = input("You: ")
         if user_query.strip().lower() in ["exit", "quit"]:
             print("Exiting chat.")
             break
-        messages.append(HumanMessage(content=user_query))
-        state = {
-            "messages": messages,
-            "user_query": user_query,
-            "search_queries": [],
-            "search_results": [],
-            "final_summary": ""
-        }
+        
+        # Update state with new message and query, but preserve other state data
+        state["messages"].append(HumanMessage(content=user_query))
+        state["user_query"] = user_query
+        
+        # Save previous search_results in case the new turn doesn't generate any
+        prev_search_results = state.get("search_results", [])
+        
         # Use session_id to persist memory for this user
         result = graph.invoke(state, config={"configurable": {"thread_id": session_id}})
+        
+        # If the new result has empty search_results, keep the previous ones
+        if result.get("search_results"):
+            state["search_results"] = result["search_results"]
+        else:
+            state["search_results"] = prev_search_results
+        
+        # Update other state keys
+        for k, v in result.items():
+            if k != "search_results":
+                state[k] = v
+        
         response = result["messages"][-1].content
         print("Assistant:", response)
         # Optionally, update messages with assistant's reply if you want to keep full history
         # from langchain_core.messages import AIMessage
-        # messages.append(AIMessage(content=response))
+        # state["messages"].append(AIMessage(content=response))
 
 if __name__ == "__main__":
     import sys

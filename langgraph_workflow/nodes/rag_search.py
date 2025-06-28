@@ -1,5 +1,5 @@
 from langchain_core.messages import HumanMessage
-from langgraph_workflow.utils.helpers import generate_search_queries, pinecone_search, summarize_results, detect_language
+from langgraph_workflow.utils.helpers import generate_search_queries, pinecone_search, detect_language
 import time
 
 def rag_search_node(state):
@@ -38,24 +38,26 @@ def rag_search_node(state):
         print("🔍 Debug - Image URLs found:")
         for i, match in enumerate(all_matches[:3]):  # Show first 3
             metadata = match.get('metadata', {})
-            image_url = (metadata.get('main_image_url') or 
-                        metadata.get('image_url') or 
-                        metadata.get('image') or 
-                        'N/A')
-            print(f"   Product {i+1}: {image_url}")
+            image_urls = metadata.get('image_urls', [])
+            main_image_url = metadata.get('main_image_url', '')
+            total_images = metadata.get('total_images', 0)
+            
+            if image_urls:
+                print(f"   Product {i+1}: {len(image_urls)} images available")
+                print(f"      Main: {main_image_url}")
+                if len(image_urls) > 1:
+                    print(f"      Additional: {len(image_urls) - 1} more images")
+            elif main_image_url:
+                print(f"   Product {i+1}: 1 image - {main_image_url}")
+            else:
+                print(f"   Product {i+1}: No images available")
     
-    # 3. Summarize results
-    summary_start = time.time()
-    summary = summarize_results(user_query, all_matches, language=language)
-    print(f"✅ RAG pipeline completed, returning summary... (summarization took {time.time() - summary_start:.2f}s)")
-    print(f"⏱️ Total RAG time: {time.time() - start_time:.2f}s")
+    print(f"✅ RAG pipeline completed, returning search results... (took {time.time() - start_time:.2f}s)")
     
-    # Update state with all info
+    # Update state with search results only - no verbose summary message
     return {
-        "messages": [HumanMessage(content=summary)],
         "user_query": user_query,
         "search_queries": search_queries,
         "search_results": all_matches,
-        "final_summary": summary,
         "language": language
     } 

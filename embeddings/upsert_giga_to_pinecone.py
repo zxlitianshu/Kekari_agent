@@ -95,6 +95,14 @@ for product in all_products:
         material = attributes.get("main_material")
         scene = attributes.get("scene")
 
+    # Get all images from the product
+    image_urls = product.get("image_urls", [])
+    main_image_url = product.get("main_image_url", "")
+    
+    # Ensure we have at least the main image if image_urls is empty
+    if not image_urls and main_image_url:
+        image_urls = [main_image_url]
+    
     # Only include selected fields as metadata, checking both snake_case and camelCase
     metadata = {}
     field_variants = [
@@ -109,7 +117,6 @@ for product in all_products:
         ("width_cm", "widthCm"),
         ("height_cm", "heightCm"),
         ("sku",),
-        ("main_image_url",),
         ("US",),
         ("EU",)
     ]
@@ -117,6 +124,7 @@ for product in all_products:
         value = get_field(product, *variants)
         if value is not None:
             metadata[variants[0]] = value
+    
     # Add parsed color/material/scene if present
     if color is not None:
         metadata["color"] = color
@@ -124,14 +132,30 @@ for product in all_products:
         metadata["material"] = material
     if scene is not None:
         metadata["scene"] = scene
+    
     # Add characteristics as plain text
     characteristics_text = " ".join(product.get("characteristics", []) or [])
     metadata["characteristics_text"] = characteristics_text
+    
+    # Add all image URLs to metadata
+    metadata["image_urls"] = image_urls
+    metadata["main_image_url"] = main_image_url
+    metadata["total_images"] = len(image_urls)
 
+    # Create text embedding and upsert
     text_vector = get_text_embedding(text_for_embedding)
     index.upsert([
         (f"{product_id}_text", text_vector, {**metadata, "type": "text"})
     ])
-    print(f"Upserted {product_id} to Pinecone.")
+    
+    # Create separate entries for each image with the same text embedding
+    # This allows for image-based search while maintaining product context
+    for i, image_url in enumerate(image_urls):
+        image_metadata = {**metadata, "type": "image", "image_index": i, "image_url": image_url}
+        index.upsert([
+            (f"{product_id}_image_{i}", text_vector, image_metadata)
+        ])
+    
+    print(f"Upserted {product_id} with {len(image_urls)} images to Pinecone.")
 
-print("All products upserted to Pinecone.") 
+print("All products and images upserted to Pinecone.") 

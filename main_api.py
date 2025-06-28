@@ -12,6 +12,9 @@ from contextlib import asynccontextmanager
 from fastapi.responses import StreamingResponse
 import json
 import uuid
+from uuid import uuid4
+from langchain_core.messages import HumanMessage
+import time
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -52,8 +55,9 @@ print("OPENAI_API_KEY loaded:", os.getenv("OPENAI_API_KEY"))
 # Set OpenAI key
 os.environ["OPENAI_API_KEY"] = config.OPENAI_API_KEY
 
-# Global storage for session-based conversation IDs
-session_conversations = {}
+# In-memory session store (for dev)
+# session_store = {}
+GLOBAL_STATE = None
 
 class Message(BaseModel):
     role: str
@@ -87,84 +91,53 @@ async def chat(request: Request):
     return {"response": reply}
 
 @app.post("/v1/chat/completions")
-async def openai_chat(request: ChatRequest, http_request: Request):
-    # Force streaming compatibility
-    print("🟡 Incoming ChatRequest:", request)
-    
-    # Extract session ID from headers or generate one
-    session_id = None
-    
-    # Try to get session ID from common headers
-    session_headers = [
-        "X-Session-ID",
-        "Session-ID", 
-        "X-Client-ID",
-        "Client-ID",
-        "X-Request-ID",
-        "Request-ID"
-    ]
-    
-    for header_name in session_headers:
-        if header_name in http_request.headers:
-            session_id = http_request.headers[header_name]
-            print(f"✅ Found session ID in header '{header_name}': {session_id}")
-            break
-    
-    # If no session ID found, try to use client IP + User-Agent as session identifier
-    if not session_id:
-        client_ip = http_request.client.host if http_request.client else "unknown"
-        user_agent = http_request.headers.get("User-Agent", "unknown")
-        session_id = f"{client_ip}-{user_agent[:50]}"  # Truncate User-Agent
-        print(f"🆔 Generated session ID from client info: {session_id}")
-    
-    # Get or create conversation ID for this session
-    if session_id in session_conversations:
-        conversation_id = session_conversations[session_id]
-        print(f"🔄 Using existing conversation for session: {conversation_id}")
+async def chat_endpoint(request: Request):
+    global GLOBAL_STATE
+    data = await request.json()
+    user_query = data["messages"][-1]["content"]
+    # Ignore session_id, use only one global state
+    if GLOBAL_STATE is None:
+        GLOBAL_STATE = {
+            "messages": [],
+            "user_query": "",
+            "search_queries": [],
+            "search_results": [],
+            "final_summary": ""
+        }
+    state = GLOBAL_STATE
+    state["messages"].append(HumanMessage(content=user_query))
+    state["user_query"] = user_query
+    prev_search_results = state.get("search_results", [])
+    result = graph.invoke(state, config={"configurable": {"thread_id": "demo"}})
+    if result.get("search_results"):
+        state["search_results"] = result["search_results"]
     else:
-        conversation_id = str(uuid.uuid4())
-        session_conversations[session_id] = conversation_id
-        print(f"🆕 Created new conversation for session: {conversation_id}")
-    
-    state = {
-        "messages": [m.dict() for m in request.messages],
-        "user_query": request.messages[-1].content if request.messages else "",
-        "search_queries": [],
-        "search_results": [],
-        "final_summary": "",
-        "language": "en",
-        "use_metadata_filter": False,
-        "metadata_filters": {},
-    }
+        state["search_results"] = prev_search_results
+    for k, v in result.items():
+        if k != "search_results":
+            state[k] = v
+    GLOBAL_STATE = state  # Save back to global
 
-    try:
-        result = graph.invoke(state, config={"configurable": {"thread_id": conversation_id}})
-        messages = result.get("messages", [])
-        reply = messages[-1].content.strip() if messages else "⚠️ LangGraph returned no messages."
-        print("🟢 Final assistant reply:", reply)
+    # Debug: Print all messages in result
+    print("🔍 API Debug - All messages in result:")
+    for i, m in enumerate(result["messages"]):
+        print(f"{i}: {getattr(m, 'content', m)} (type: {getattr(m, 'type', None)}, role: {getattr(m, 'role', None)})")
 
-        # Construct OpenAI-compatible streamed response
-        def fake_stream():
-            data = {
-                "id": "chatcmpl-2025agent",
-                "object": "chat.completion.chunk",
-                "choices": [{
-                    "delta": {"role": "assistant", "content": reply},
-                    "index": 0,
-                    "finish_reason": None
-                }]
-            }
-            yield f"data: {json.dumps(data)}\n\n"
-            yield "data: [DONE]\n\n"
-
-        return StreamingResponse(fake_stream(), media_type="text/event-stream")
-
-    except Exception as e:
-        print("🔴 Error:", e)
-        return JSONResponse({
-            "error": str(e),
-            "message": "❌ Backend failed"
-        }, status_code=500)
+    # Just return the last message in the list, regardless of type/role
+    response_text = result["messages"][-1].content if result.get("messages") else ""
+    def fake_stream():
+        chunk = {
+            "id": f"chatcmpl-demo",
+            "object": "chat.completion.chunk",
+            "choices": [{
+                "delta": {"role": "assistant", "content": response_text},
+                "index": 0,
+                "finish_reason": None
+            }]
+        }
+        yield f"data: {json.dumps(chunk)}\n\n"
+        yield "data: [DONE]\n\n"
+    return StreamingResponse(fake_stream(), media_type="text/event-stream")
 
 @app.get("/info")
 async def info():
@@ -232,16 +205,16 @@ async def list_sessions():
     return JSONResponse({
         "sessions": [
             {"session_id": session_id, "conversation_id": conv_id}
-            for session_id, conv_id in session_conversations.items()
+            for session_id, conv_id in session_store.items()
         ],
-        "total": len(session_conversations)
+        "total": len(session_store)
     })
 
 @app.delete("/sessions/{session_id}")
 async def delete_session(session_id: str):
     """Delete a specific session"""
-    if session_id in session_conversations:
-        del session_conversations[session_id]
+    if session_id in session_store:
+        del session_store[session_id]
         print(f"🗑️ Deleted session: {session_id}")
         return JSONResponse({
             "success": True,
@@ -256,8 +229,8 @@ async def delete_session(session_id: str):
 @app.delete("/sessions")
 async def clear_all_sessions():
     """Clear all sessions"""
-    global session_conversations
-    session_conversations.clear()
+    global session_store
+    session_store.clear()
     print("🗑️ Cleared all sessions")
     return JSONResponse({
         "success": True,

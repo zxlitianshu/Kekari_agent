@@ -1,5 +1,5 @@
 from langchain_core.messages import HumanMessage
-from langgraph_workflow.utils.helpers import generate_search_queries, pinecone_search, summarize_results
+from langgraph_workflow.utils.helpers import generate_search_queries, pinecone_search
 
 def metadata_filter_search_node(state):
     print("🔄 LangGraph: Executing 'metadata_filter_search' node...")
@@ -26,14 +26,10 @@ def metadata_filter_search_node(state):
                 })
                 seen_ids.add(m['id'])
     print(f"📦 Retrieved {len(all_matches)} unique products (with metadata filter).")
-    # 3. Summarize results
-    summary = summarize_results(user_query, all_matches, language=language)
-    print("✅ Metadata filter RAG pipeline completed, returning summary...")
-    # Update state with all info
+    print("✅ Metadata filter RAG pipeline completed, returning search results...")
+    # Update state with search results only - no verbose summary message
     return {
         **state,
-        "messages": [HumanMessage(content=summary)],
         "search_queries": search_queries,
-        "search_results": all_matches,
-        "final_summary": summary
+        "search_results": all_matches
     } 

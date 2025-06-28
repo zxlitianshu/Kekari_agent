@@ -2,7 +2,7 @@
 
 from typing import Annotated
 from typing_extensions import TypedDict
-from langgraph.graph import StateGraph
+from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import InMemorySaver
 
@@ -11,6 +11,8 @@ from .nodes.rag_search import rag_search_node
 from .nodes.metadata_filter_search import metadata_filter_search_node
 from .nodes.planning import planning_node
 from .nodes.gpt4_chat import gpt4_chat_node
+from .nodes.shopify_agent import shopify_agent_node
+from .nodes.filter_search_results import filter_search_results_node
 
 # Define the LangGraph state
 class GraphState(TypedDict):
@@ -22,6 +24,9 @@ class GraphState(TypedDict):
     language: str
     use_metadata_filter: bool
     metadata_filters: dict
+    # NEW FIELDS FOR SHOPIFY AGENT
+    shopify_products: list
+    shopify_status: dict
 
 # Decision node: Should we use metadata filter search?
 def decide_search_strategy_node(state: GraphState):
@@ -33,7 +38,7 @@ def decide_search_strategy_node(state: GraphState):
          "category_code", "weight", "length", "width", "height", "weight_kg", "length_cm", "width_cm", "height_cm", "sku", "main_image_url", "US", "EU",  "material", "scene"
     ]
     from langchain_community.chat_models import ChatOpenAI
-    llm = ChatOpenAI(model="gpt-4")
+    llm = ChatOpenAI(model="gpt-4o")
     prompt = (
         f"Here is the full conversation so far:\n{history}\n\n"
         f"Available metadata fields: {metadata_fields}\n"
@@ -61,15 +66,24 @@ def create_graph():
     builder.add_node("decide_search_strategy", decide_search_strategy_node)
     builder.add_node("rag_search", rag_search_node)
     builder.add_node("metadata_filter_search", metadata_filter_search_node)
+    builder.add_node("shopify_agent", shopify_agent_node)
+    builder.add_node("filter_search_results", filter_search_results_node)
     
-    # Planning node routes to gpt4_chat or decide_search_strategy
+    # Planning node routes to gpt4_chat, decide_search_strategy, or shopify_agent
     def plan_route(state):
-        return state.get("plan_action", "decide_search_strategy")
+        plan_action = state.get("plan_action", "decide_search_strategy")
+        if plan_action == "shopify_agent":
+            return "shopify_agent"
+        return plan_action
     
     builder.add_conditional_edges(
         "planning",
         plan_route,
-        {"decide_search_strategy": "decide_search_strategy", "gpt4_chat": "gpt4_chat"}
+        {
+            "decide_search_strategy": "decide_search_strategy", 
+            "gpt4_chat": "gpt4_chat",
+            "shopify_agent": "shopify_agent"
+        }
     )
     
     # Conditional routing based on use_metadata_filter
@@ -81,6 +95,16 @@ def create_graph():
         route_decision,
         {"rag_search": "rag_search", "metadata_filter_search": "metadata_filter_search"}
     )
+    
+    # After rag_search or metadata_filter_search, go directly to gpt4_chat instead of planning
+    builder.add_edge("rag_search", "gpt4_chat")
+    builder.add_edge("metadata_filter_search", "gpt4_chat")
+    
+    # After gpt4_chat, end the workflow (no more routing)
+    builder.add_edge("gpt4_chat", END)
+    
+    # After shopify_agent, end the workflow (no more routing)
+    builder.add_edge("shopify_agent", END)
     
     # Set entry point to planning
     builder.set_entry_point("planning")
