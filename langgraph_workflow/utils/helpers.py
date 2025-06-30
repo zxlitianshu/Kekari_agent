@@ -7,28 +7,51 @@ from langdetect import detect
 def generate_search_queries(user_query, n=2):
     # Use GPT-4o for better performance
     llm = ChatOpenAI(model="gpt-4o", temperature=0.1, request_timeout=10)
-    prompt = f"""Query: '{user_query}'
-Generate {n} short search terms (2-4 words each) for finding relevant products.
-Return: ['term1', 'term2']"""
+    prompt = f"""You are a product search expert. The user wants to find products and has given this query: '{user_query}'
+
+Your task is to generate {n} effective search terms (2-4 words each) that will help find the most relevant products.
+
+IMPORTANT RULES:
+1. Pay attention to the user's specific requirements (outdoor, indoor, color, material, weight, etc.)
+2. If the user mentions "户外" (outdoor), use "outdoor" or "户外" in your search terms
+3. If the user mentions "室内" (indoor), use "indoor" or "室内" in your search terms
+4. Include key product characteristics like material, color, or category
+5. Keep terms short but specific (2-4 words max)
+6. Return exactly {n} search terms
+
+Examples:
+- User: "帮我看看有没有适合户外场景的产品" → ["outdoor products", "户外用品"]
+- User: "找黑色的桌子" → ["black table", "黑色桌子"]
+- User: "铝制户外家具" → ["aluminum outdoor furniture", "铝制户外家具"]
+
+Return the search terms as a JSON array: ["term1", "term2"]"""
 
     response = llm.invoke(prompt)
     
     # Try to extract list from response
     try:
-        # Look for list pattern in response
+        # Look for JSON array pattern in response
         import re
-        list_match = re.search(r'\[.*?\]', response.content)
-        if list_match:
-            queries = eval(list_match.group())
+        import json
+        # Try to find JSON array
+        json_match = re.search(r'\[.*?\]', response.content)
+        if json_match:
+            queries = json.loads(json_match.group())
             if isinstance(queries, list) and len(queries) > 0:
                 return queries[:n]  # Limit to n queries
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"⚠️ JSON parsing failed: {e}")
     
     # Fallback: split by lines and clean up
     lines = [line.strip().strip('- ').strip('"').strip("'") for line in response.content.split('\n')]
-    queries = [line for line in lines if line and len(line) > 2 and len(line) < 30]  # Reduced max length
-    return queries[:n] if queries else [user_query]
+    queries = [line for line in lines if line and len(line) > 2 and len(line) < 30]
+    
+    if not queries:
+        # Last resort: use the original query
+        print(f"⚠️ No queries generated, using original query: {user_query}")
+        return [user_query]
+    
+    return queries[:n]
 
 # Helper: Pinecone search for a query
 def pinecone_search(query, top_k=3, filter=None):

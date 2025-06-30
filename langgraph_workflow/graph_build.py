@@ -14,8 +14,8 @@ from .nodes.gpt4_chat import gpt4_chat_node
 from .nodes.shopify_agent import shopify_agent_node
 from .nodes.filter_search_results import filter_search_results_node
 from .nodes.image_agent import image_agent_node
+from .nodes.standalone_image_agent import standalone_image_agent_node
 from .nodes.listing_database import listing_database_node
-from .nodes.intent_parser_agent import intent_parser_node
 
 # Define the LangGraph state
 class GraphState(TypedDict):
@@ -35,14 +35,15 @@ class GraphState(TypedDict):
     modified_images: list
     image_agent_response: str
     awaiting_confirmation: bool
+    # NEW FIELDS FOR STANDALONE IMAGE AGENT
+    standalone_image_response: str
     # NEW FIELDS FOR LISTING DATABASE
     listing_database_response: str
     listing_ready_products: list
-    # NEW FIELDS FOR INTENT PARSER
-    parsed_intent: dict
-    action_type: str
-    # NEW FIELD FOR COMPOUND REQUESTS
+    # NEW FIELDS FOR COMPOUND REQUESTS
     incorporate_previous: bool
+    # NEW FIELD FOR UPLOADED FILES
+    uploaded_files: list
 
 # Decision node: Should we use metadata filter search?
 def decide_search_strategy_node(state: GraphState):
@@ -85,18 +86,12 @@ def create_graph():
     builder.add_node("shopify_agent", shopify_agent_node)
     builder.add_node("filter_search_results", filter_search_results_node)
     builder.add_node("image_agent", image_agent_node)
+    builder.add_node("standalone_image_agent", standalone_image_agent_node)
     builder.add_node("listing_database", listing_database_node)
-    builder.add_node("intent_parser", intent_parser_node)
     
-    # Planning node routes to gpt4_chat, decide_search_strategy, intent_parser, or listing_database
+    # Simplified routing: Planning node routes directly to appropriate service
     def plan_route(state):
         plan_action = state.get("plan_action", "decide_search_strategy")
-        if plan_action == "shopify_agent":
-            return "intent_parser"  # Route to intent parser first
-        elif plan_action == "image_agent":
-            return "intent_parser"  # Route to intent parser first
-        elif plan_action == "listing_database":
-            return "listing_database"
         return plan_action
     
     builder.add_conditional_edges(
@@ -105,33 +100,14 @@ def create_graph():
         {
             "decide_search_strategy": "decide_search_strategy", 
             "gpt4_chat": "gpt4_chat",
-            "intent_parser": "intent_parser",
+            "shopify_agent": "shopify_agent",
+            "image_agent": "image_agent",
+            "standalone_image_agent": "standalone_image_agent",
             "listing_database": "listing_database"
         }
     )
     
-    # Intent parser routes to either shopify_agent or image_agent based on action_type
-    def intent_parser_route(state):
-        action_type = state.get("action_type", "general")
-        if action_type == "shopify_listing":
-            return "shopify_agent"
-        elif action_type == "image_modification":
-            return "image_agent"
-        else:
-            # Fallback to gpt4_chat if action type is unclear
-            return "gpt4_chat"
-    
-    builder.add_conditional_edges(
-        "intent_parser",
-        intent_parser_route,
-        {
-            "shopify_agent": "shopify_agent",
-            "image_agent": "image_agent",
-            "gpt4_chat": "gpt4_chat"
-        }
-    )
-    
-    # Conditional routing based on use_metadata_filter
+    # Search strategy routes to appropriate search method
     def route_decision(state):
         return "metadata_filter_search" if state.get("use_metadata_filter") else "rag_search"
     
@@ -141,21 +117,29 @@ def create_graph():
         {"rag_search": "rag_search", "metadata_filter_search": "metadata_filter_search"}
     )
     
-    # After rag_search or metadata_filter_search, go directly to gpt4_chat instead of planning
+    # After search, go to GPT chat to display results
     builder.add_edge("rag_search", "gpt4_chat")
     builder.add_edge("metadata_filter_search", "gpt4_chat")
     
-    # After gpt4_chat, end the workflow (no more routing)
+    # All agents end the workflow directly
     builder.add_edge("gpt4_chat", END)
-    
-    # After shopify_agent, end the workflow (no more routing)
     builder.add_edge("shopify_agent", END)
+    builder.add_edge("image_agent", END)
+    builder.add_edge("standalone_image_agent", END)
     
-    # After image_agent, go to gpt4_chat to provide response to user
-    builder.add_edge("image_agent", "gpt4_chat")
+    # Listing database can route to shopify_agent or end
+    def listing_database_route(state):
+        action_type = state.get("action_type", "")
+        if action_type == "shopify_agent":
+            return "shopify_agent"
+        else:
+            return END
     
-    # After listing_database, go to gpt4_chat to provide response to user
-    builder.add_edge("listing_database", "gpt4_chat")
+    builder.add_conditional_edges(
+        "listing_database",
+        listing_database_route,
+        {"shopify_agent": "shopify_agent", END: END}
+    )
     
     # Set entry point to planning
     builder.set_entry_point("planning")

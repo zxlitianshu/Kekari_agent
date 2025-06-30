@@ -1,7 +1,7 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional, Dict, Any, Union
 from langgraph_workflow.graph_build import create_graph
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
@@ -13,25 +13,34 @@ from fastapi.responses import StreamingResponse
 import json
 import uuid
 from uuid import uuid4
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, AIMessage
 import time
+import tempfile
+import base64
+from langchain_community.chat_models import ChatOpenAI
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
+    print("🚀 Backend starting up - clearing all session memory...")
+    global session_store, GLOBAL_STATE
+    session_store.clear()
+    GLOBAL_STATE = None
+    print("✅ All session memory cleared - starting fresh!")
     yield
     # Shutdown
+    print("🛑 Backend shutting down...")
 
 app = FastAPI(lifespan=lifespan)
 
 # Allow frontend to connect (adjust origins as needed)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8080"],  # Only allow OpenWebUI frontend
+    allow_origins=["http://localhost:8080", "http://localhost:3000", "http://127.0.0.1:8080", "http://127.0.0.1:3000"],  # Allow OpenWebUI and other common ports
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Content-Type", "X-Requested-With"],
+    expose_headers=["Content-Type", "X-Requested-With", "Cache-Control", "Connection"],
 )
 
 # # Add timeout middleware
@@ -59,14 +68,105 @@ os.environ["OPENAI_API_KEY"] = config.OPENAI_API_KEY
 session_store = {}
 GLOBAL_STATE = None
 
+def clear_session_memory():
+    """Clear all session memory to start fresh."""
+    global session_store, GLOBAL_STATE
+    session_store.clear()
+    GLOBAL_STATE = None
+    print("🧹 Session memory cleared - starting fresh!")
+
 class Message(BaseModel):
     role: str
-    content: str
+    content: Union[str, List[Dict[str, Any]]]  # Support both string and multimodal content
 
 class ChatRequest(BaseModel):
-    model: str
     messages: List[Message]
-    stream: bool = False
+    session_id: Optional[str] = None
+
+class ChatResponse(BaseModel):
+    response: str
+    session_id: str
+
+def process_multimodal_content(content_list):
+    """Process multimodal content, handling images properly to avoid token limits."""
+    text_content = ""
+    image_count = 0
+    image_urls = []
+    base64_images = []
+    
+    for content_item in content_list:
+        if content_item.get("type") == "text":
+            text_content += content_item.get("text", "")
+        elif content_item.get("type") == "image_url":
+            image_url = content_item.get("image_url", {}).get("url", "")
+            if image_url:
+                # Check if it's a base64 image
+                if image_url.startswith("data:image/"):
+                    # For base64 images, store them for processing
+                    image_count += 1
+                    base64_images.append(image_url)
+                else:
+                    # For regular URLs, include them
+                    image_urls.append(image_url)
+    
+    # Add image information to text content
+    if image_count > 0:
+        if image_urls:
+            # Both base64 and URLs
+            image_info = f"\n[Images: {image_count} uploaded image(s) + {len(image_urls)} URL(s): {', '.join(image_urls)}]"
+        else:
+            # Only base64 images
+            image_info = f"\n[Images: {image_count} uploaded image(s)]"
+        text_content += image_info
+    elif image_urls:
+        # Only URLs
+        image_info = f"\n[Images: {', '.join(image_urls)}]"
+        text_content += image_info
+    
+    return text_content, image_count, image_urls, base64_images
+
+def save_base64_images_to_session(base64_images, session_id):
+    """Save base64 images as uploaded files in the session."""
+    if not base64_images:
+        return []
+    
+    uploaded_files = []
+    temp_dir = tempfile.mkdtemp()
+    
+    for i, base64_data in enumerate(base64_images):
+        try:
+            # Extract the data part from base64 URL
+            if base64_data.startswith("data:image/"):
+                # Parse the data URL
+                header, data = base64_data.split(",", 1)
+                # Extract content type
+                content_type = header.split(":")[1].split(";")[0]
+                # Extract file extension
+                ext = content_type.split("/")[1] if "/" in content_type else "jpg"
+                
+                # Decode base64 data
+                image_data = base64.b64decode(data)
+                
+                # Create temporary file
+                filename = f"uploaded_image_{i+1}.{ext}"
+                temp_path = os.path.join(temp_dir, filename)
+                
+                with open(temp_path, "wb") as f:
+                    f.write(image_data)
+                
+                uploaded_files.append({
+                    "path": temp_path,
+                    "filename": filename,
+                    "content_type": content_type,
+                    "size": len(image_data)
+                })
+                
+                print(f"💾 Saved base64 image as: {temp_path}")
+                
+        except Exception as e:
+            print(f"❌ Error saving base64 image: {e}")
+    
+    return uploaded_files
 
 @app.post("/api/chat")
 async def chat(request: Request):
@@ -107,69 +207,445 @@ async def chat(request: Request):
     return {"response": reply}
 
 @app.post("/v1/chat/completions")
-async def chat_endpoint(request: Request):
-    global GLOBAL_STATE
-    data = await request.json()
-    user_query = data["messages"][-1]["content"]
-    # Ignore session_id, use only one global state
-    if GLOBAL_STATE is None:
-        GLOBAL_STATE = {
-            "messages": [],
-            "user_query": "",
-            "search_queries": [],
-            "search_results": [],
-            "final_summary": "",
-            # NEW FIELDS FOR SHOPIFY AGENT
-            "shopify_products": [],
-            "shopify_status": {},
-            # NEW FIELDS FOR IMAGE AGENT
-            "image_modification_request": {},
-            "modified_images": [],
-            "image_agent_response": "",
-            "awaiting_confirmation": False,
-            # NEW FIELDS FOR LISTING DATABASE
-            "listing_database_response": "",
-            "listing_ready_products": [],
-            # NEW FIELDS FOR INTENT PARSER
-            "parsed_intent": {},
-            "action_type": "general",
-            # NEW FIELD FOR COMPOUND REQUESTS
-            "incorporate_previous": False,
+async def chat_completions(request: ChatRequest):
+    """Main chat endpoint that handles both regular chat and image processing with streaming support."""
+    try:
+        # 🧹 CLEAR SESSION MEMORY - START FRESH EVERY TIME
+        # clear_session_memory()
+        
+        # Extract messages and session info
+        messages = []
+        base64_images = []
+        
+        for msg in request.messages:
+            if msg.role == "user":
+                # Handle multimodal content
+                if isinstance(msg.content, list):
+                    # Process multimodal content properly
+                    text_content, image_count, image_urls, msg_base64_images = process_multimodal_content(msg.content)
+                    messages.append(HumanMessage(content=text_content))
+                    base64_images.extend(msg_base64_images)
+                else:
+                    # Regular text content
+                    messages.append(HumanMessage(content=msg.content))
+            elif msg.role == "assistant":
+                messages.append(AIMessage(content=msg.content))
+        
+        session_id = request.session_id or "default"
+        
+        # Get or create session state
+        if session_id not in session_store:
+            session_store[session_id] = {
+                "messages": [],
+                "search_results": [],
+                "parsed_intent": {},
+                "image_modification_request": {},
+                "modified_images": [],
+                "awaiting_confirmation": False,
+                "incorporate_previous": False,
+                "uploaded_files": [],
+                "action_type": "general",
+            }
+        
+        session_state = session_store[session_id]
+        
+        # IMPORTANT: Clear uploaded files at the beginning of each request to prevent accumulation
+        session_state["uploaded_files"] = []
+        
+        # Save base64 images as uploaded files (only from current request)
+        if base64_images:
+            new_uploaded_files = save_base64_images_to_session(base64_images, session_id)
+            session_state["uploaded_files"] = new_uploaded_files  # Replace, don't extend
+            print(f"📁 Added {len(new_uploaded_files)} uploaded files to session (current request only)")
+        else:
+            print(f"📁 No uploaded files in current request")
+        
+        # Add new message to session (append instead of overwrite)
+        if session_state["messages"]:
+            # Append only the new messages that aren't already in the session
+            existing_messages = session_state["messages"]
+            new_messages = []
+            
+            for msg in messages:
+                # Check if this message is already in the session
+                is_duplicate = False
+                for existing_msg in existing_messages:
+                    if (isinstance(msg, type(existing_msg)) and 
+                        msg.content == existing_msg.content):
+                        is_duplicate = True
+                        break
+                
+                if not is_duplicate:
+                    new_messages.append(msg)
+            
+            # Append new messages to existing ones
+            session_state["messages"].extend(new_messages)
+        else:
+            # First time, just set the messages
+            session_state["messages"] = messages
+        
+        # Prepare state for LangGraph
+        state = {
+            "messages": session_state["messages"],
+            "search_results": session_state.get("search_results", []),
+            "parsed_intent": session_state.get("parsed_intent", {}),
+            "image_modification_request": session_state.get("image_modification_request", {}),
+            "modified_images": session_state.get("modified_images", []),
+            "awaiting_confirmation": session_state.get("awaiting_confirmation", False),
+            "incorporate_previous": session_state.get("incorporate_previous", False),
+            "uploaded_files": session_state.get("uploaded_files", []),
+            "action_type": session_state.get("action_type", "general"),
         }
-    state = GLOBAL_STATE
-    state["messages"].append(HumanMessage(content=user_query))
-    state["user_query"] = user_query
-    prev_search_results = state.get("search_results", [])
-    result = graph.invoke(state, config={"configurable": {"thread_id": "demo"}})
-    if result.get("search_results"):
-        state["search_results"] = result["search_results"]
-    else:
-        state["search_results"] = prev_search_results
-    for k, v in result.items():
-        if k != "search_results":
-            state[k] = v
-    GLOBAL_STATE = state  # Save back to global
+        
+        # Debug: Check what's in the state
+        print(f"🔍 Debug - State uploaded_files count: {len(state.get('uploaded_files', []))}")
+        print(f"🔍 Debug - Session uploaded_files count: {len(session_state.get('uploaded_files', []))}")
+        
+        # Run the graph
+        result = graph.invoke(state, config={"configurable": {"thread_id": session_id}})
+        
+        # Update session state - preserve search_results if not returned by graph
+        update_data = {
+            "parsed_intent": result.get("parsed_intent", {}),
+            "image_modification_request": result.get("image_modification_request", {}),
+            "modified_images": result.get("modified_images", []),
+            "awaiting_confirmation": result.get("awaiting_confirmation", False),
+            "incorporate_previous": result.get("incorporate_previous", False),
+            "uploaded_files": result.get("uploaded_files", []),
+            "action_type": result.get("action_type", session_state.get("action_type", "general")),
+        }
+        
+        # Always preserve search_results - only update if new ones are returned
+        if "search_results" in result:
+            update_data["search_results"] = result["search_results"]
+            print(f"🔍 Session Update: Graph returned {len(result['search_results'])} search results")
+        else:
+            # Preserve existing search_results if not returned by graph
+            existing_results = session_state.get("search_results", [])
+            update_data["search_results"] = existing_results
+            print(f"🔍 Session Update: Preserving {len(existing_results)} existing search results")
+        
+        session_store[session_id].update(update_data)
+        
+        # IMPORTANT: Clear uploaded files after processing to prevent accumulation
+        session_store[session_id]["uploaded_files"] = []
+        
+        # Get the last AI message or use image agent response
+        ai_messages = [msg for msg in result["messages"] if isinstance(msg, AIMessage)]
+        
+        # SIMPLE: Just return the last AI message from the graph
+        if ai_messages:
+            response_content = ai_messages[-1].content
+            response_type = "ai_message"
+        else:
+            response_content = "I'm sorry, I couldn't generate a response."
+            response_type = "error"
+        
+        # Debug logging
+        print(f"🔍 API Debug - Response selection:")
+        print(f"  - ai_messages count: {len(ai_messages)}")
+        print(f"  - Selected response type: {response_type}")
+        
+        print(f"🔍 API Debug - All messages in result:")
+        for i, msg in enumerate(result["messages"]):
+            print(f"{i}: {msg.content[:100]}... (type: {type(msg).__name__}, role: {getattr(msg, 'role', None)})")
+        
+        # Check if Shopify agent has returned a specific response
+        shopify_status = result.get("shopify_status")
+        if shopify_status and shopify_status.get("message"):
+            response_content = shopify_status["message"]
+            response_type = "shopify_response"
+        
+        # Return streaming response
+        async def generate_stream():
+            # Send an immediate message so the frontend can show something
+            response_id = f"chatcmpl-{uuid4().hex}"
+            created_time = int(time.time())
+            initial_chunk = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": "Homywork-Agent V3.6 AI助手",
+                "choices": [{
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": "⏳ Processing started, please wait...\n"},
+                    "finish_reason": None
+                }]
+            }
+            yield f"data: {json.dumps(initial_chunk)}\n\n"
+            await asyncio.sleep(0.5)  # Give frontend time to show spinner
 
-    # Debug: Print all messages in result
-    print("🔍 API Debug - All messages in result:")
-    for i, m in enumerate(result["messages"]):
-        print(f"{i}: {getattr(m, 'content', m)} (type: {getattr(m, 'type', None)}, role: {getattr(m, 'role', None)})")
+            # Stream content in chunks (fake streaming)
+            words = response_content.split()
+            for i, word in enumerate(words):
+                content_chunk = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": "Homywork-Agent V3.6 AI助手",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": word + (" " if i < len(words) - 1 else "")},
+                        "finish_reason": None
+                    }]
+                }
+                yield f"data: {json.dumps(content_chunk)}\n\n"
+                await asyncio.sleep(0.05)
 
-    # Just return the last message in the list, regardless of type/role
-    response_text = result["messages"][-1].content if result.get("messages") else ""
-    def fake_stream():
-        chunk = {
-            "id": f"chatcmpl-demo",
-            "object": "chat.completion.chunk",
+            # Send final chunk
+            final_chunk = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": "Homywork-Agent V3.6 AI助手",
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }]
+            }
+            yield f"data: {json.dumps(final_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
+        
+        return StreamingResponse(
+            generate_stream(),
+            media_type="text/plain",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "Content-Type": "text/event-stream",
+            }
+        )
+        
+    except Exception as e:
+        print(f"❌ Error in chat completions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/v1/chat/completions/json")
+async def chat_completions_json(request: ChatRequest):
+    """JSON endpoint for chat completions with proper OpenAI-compatible format."""
+    try:
+        # Extract messages and session info
+        messages = []
+        base64_images = []
+        
+        for msg in request.messages:
+            if msg.role == "user":
+                # Handle multimodal content
+                if isinstance(msg.content, list):
+                    # Process multimodal content properly
+                    text_content, image_count, image_urls, msg_base64_images = process_multimodal_content(msg.content)
+                    messages.append(HumanMessage(content=text_content))
+                    base64_images.extend(msg_base64_images)
+                else:
+                    # Regular text content
+                    messages.append(HumanMessage(content=msg.content))
+            elif msg.role == "assistant":
+                messages.append(AIMessage(content=msg.content))
+        
+        session_id = request.session_id or "default"
+        
+        # Get or create session state
+        if session_id not in session_store:
+            session_store[session_id] = {
+                "messages": [],
+                "search_results": [],
+                "parsed_intent": {},
+                "image_modification_request": {},
+                "modified_images": [],
+                "awaiting_confirmation": False,
+                "incorporate_previous": False,
+                "uploaded_files": [],
+                "action_type": "general",
+            }
+        
+        session_state = session_store[session_id]
+        
+        # IMPORTANT: Clear uploaded files at the beginning of each request to prevent accumulation
+        session_state["uploaded_files"] = []
+        
+        # Save base64 images as uploaded files (only from current request)
+        if base64_images:
+            new_uploaded_files = save_base64_images_to_session(base64_images, session_id)
+            session_state["uploaded_files"] = new_uploaded_files  # Replace, don't extend
+            print(f"📁 Added {len(new_uploaded_files)} uploaded files to session (current request only)")
+        else:
+            print(f"📁 No uploaded files in current request")
+        
+        # Add new message to session (append instead of overwrite)
+        if session_state["messages"]:
+            # Append only the new messages that aren't already in the session
+            existing_messages = session_state["messages"]
+            new_messages = []
+            
+            for msg in messages:
+                # Check if this message is already in the session
+                is_duplicate = False
+                for existing_msg in existing_messages:
+                    if (isinstance(msg, type(existing_msg)) and 
+                        msg.content == existing_msg.content):
+                        is_duplicate = True
+                        break
+                
+                if not is_duplicate:
+                    new_messages.append(msg)
+            
+            # Append new messages to existing ones
+            session_state["messages"].extend(new_messages)
+        else:
+            # First time, just set the messages
+            session_state["messages"] = messages
+        
+        # Prepare state for LangGraph
+        state = {
+            "messages": session_state["messages"],
+            "search_results": session_state.get("search_results", []),
+            "parsed_intent": session_state.get("parsed_intent", {}),
+            "image_modification_request": session_state.get("image_modification_request", {}),
+            "modified_images": session_state.get("modified_images", []),
+            "awaiting_confirmation": session_state.get("awaiting_confirmation", False),
+            "incorporate_previous": session_state.get("incorporate_previous", False),
+            "uploaded_files": session_state.get("uploaded_files", []),
+            "action_type": session_state.get("action_type", "general"),
+        }
+        
+        # Debug: Check what's in the state
+        print(f"🔍 Debug - State uploaded_files count: {len(state.get('uploaded_files', []))}")
+        print(f"🔍 Debug - Session uploaded_files count: {len(session_state.get('uploaded_files', []))}")
+        
+        # Run the graph
+        result = graph.invoke(state, config={"configurable": {"thread_id": session_id}})
+        
+        # Update session state - preserve search_results if not returned by graph
+        update_data = {
+            "parsed_intent": result.get("parsed_intent", {}),
+            "image_modification_request": result.get("image_modification_request", {}),
+            "modified_images": result.get("modified_images", []),
+            "awaiting_confirmation": result.get("awaiting_confirmation", False),
+            "incorporate_previous": result.get("incorporate_previous", False),
+            "uploaded_files": result.get("uploaded_files", []),
+            "action_type": result.get("action_type", session_state.get("action_type", "general")),
+        }
+        
+        # Always preserve search_results - only update if new ones are returned
+        if "search_results" in result:
+            update_data["search_results"] = result["search_results"]
+            print(f"🔍 Session Update: Graph returned {len(result['search_results'])} search results")
+        else:
+            # Preserve existing search_results if not returned by graph
+            existing_results = session_state.get("search_results", [])
+            update_data["search_results"] = existing_results
+            print(f"🔍 Session Update: Preserving {len(existing_results)} existing search results")
+        
+        session_store[session_id].update(update_data)
+        
+        # IMPORTANT: Clear uploaded files after processing to prevent accumulation
+        session_store[session_id]["uploaded_files"] = []
+        
+        # Get the last AI message or use image agent response
+        ai_messages = [msg for msg in result["messages"] if isinstance(msg, AIMessage)]
+        
+        # SIMPLE: Just return the last AI message from the graph
+        if ai_messages:
+            response_content = ai_messages[-1].content
+            response_type = "ai_message"
+        else:
+            response_content = "I'm sorry, I couldn't generate a response."
+            response_type = "error"
+        
+        # Debug logging
+        print(f"🔍 API Debug - Response selection:")
+        print(f"  - ai_messages count: {len(ai_messages)}")
+        print(f"  - Selected response type: {response_type}")
+        
+        print(f"🔍 API Debug - All messages in result:")
+        for i, msg in enumerate(result["messages"]):
+            print(f"{i}: {msg.content[:100]}... (type: {type(msg).__name__}, role: {getattr(msg, 'role', None)})")
+        
+        # Check if Shopify agent has returned a specific response
+        shopify_status = result.get("shopify_status")
+        if shopify_status and shopify_status.get("message"):
+            response_content = shopify_status["message"]
+            response_type = "shopify_response"
+        
+        # Return OpenAI-compatible JSON format
+        return {
+            "id": f"chatcmpl-{uuid4().hex}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": "Homywork-Agent V3.6 AI助手",
             "choices": [{
-                "delta": {"role": "assistant", "content": response_text},
                 "index": 0,
-                "finish_reason": None
-            }]
+                "message": {
+                    "role": "assistant",
+                    "content": response_content
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0
+            }
         }
-        yield f"data: {json.dumps(chunk)}\n\n"
-        yield "data: [DONE]\n\n"
-    return StreamingResponse(fake_stream(), media_type="text/event-stream")
+        
+    except Exception as e:
+        print(f"❌ Error in chat completions JSON: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/v1/upload-files")
+async def upload_files(
+    files: List[UploadFile] = File(...),
+    session_id: str = Form(...)
+):
+    """Upload files for image processing."""
+    try:
+        # Ensure session exists
+        if session_id not in session_store:
+            session_store[session_id] = {
+                "messages": [],
+                "search_results": [],
+                "parsed_intent": {},
+                "image_modification_request": {},
+                "modified_images": [],
+                "awaiting_confirmation": False,
+                "incorporate_previous": False,
+                "uploaded_files": [],
+                "action_type": "general",
+            }
+        
+        # Save uploaded files to temporary directory
+        uploaded_files = []
+        temp_dir = tempfile.mkdtemp()
+        
+        for file in files:
+            if file.content_type.startswith('image/'):
+                # Create temporary file
+                temp_path = os.path.join(temp_dir, file.filename)
+                with open(temp_path, "wb") as buffer:
+                    content = await file.read()
+                    buffer.write(content)
+                
+                uploaded_files.append({
+                    "path": temp_path,
+                    "filename": file.filename,
+                    "content_type": file.content_type,
+                    "size": len(content)
+                })
+        
+        # Update session with uploaded files
+        session_store[session_id]["uploaded_files"] = uploaded_files
+        
+        return {
+            "success": True,
+            "uploaded_files": len(uploaded_files),
+            "session_id": session_id,
+            "message": f"Successfully uploaded {len(uploaded_files)} image file(s)"
+        }
+        
+    except Exception as e:
+        print(f"❌ Error uploading files: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/info")
 async def info():
@@ -180,55 +656,39 @@ async def info():
     }
 
 @app.get("/v1/models")
-def list_models():
-    return JSONResponse({
-        "object": "list",
+async def list_models():
+    """List available models (for compatibility with OpenAI API)."""
+    return {
         "data": [
             {
-                "id": "Homywork v3.5 大模型",
+                "id": "Homywork-Agent V3.6 AI助手",
                 "object": "model",
-                "created": 0,
-                "owned_by": "you"
+                "created": 1234567890,
+                "owned_by": "openai"
             }
-        ]
-    })
-
-@app.get("/models")
-def list_models_alias():
-    return JSONResponse({
-        "object": "list",
-        "data": [
-            {
-                "id": "2025agent",
-                "object": "model",
-                "created": 0,
-                "owned_by": "you"
-            }
-        ]
-    })
+        ],
+        "object": "list"
+    }
 
 @app.get("/v1/models/models")
-def list_models_double_alias():
-    return JSONResponse({
-        "object": "list",
-        "data": [
-            {
-                "id": "2025agent",
-                "object": "model",
-                "created": 0,
-                "owned_by": "you"
-            }
-        ]
-    })
+async def models_endpoint():
+    """Alternative models endpoint."""
+    return await list_models()
 
-@app.post("/openai/verify")
-async def openai_verify(request: Request):
-    # Accept and ignore any body
-    return JSONResponse({"success": True, "message": "Connection verified."}) 
+@app.options("/v1/chat/completions")
+async def options_chat_completions():
+    """Handle OPTIONS requests for CORS."""
+    return {"status": "ok"}
 
-@app.post("/v1/followups")
-def followups_stub():
-    return {"questions": []}
+@app.options("/v1/chat/completions/json")
+async def options_chat_completions_json():
+    """Handle OPTIONS requests for CORS for JSON endpoint."""
+    return {"status": "ok"}
+
+@app.options("/v1/models")
+async def options_models():
+    """Handle OPTIONS requests for CORS."""
+    return {"status": "ok"}
 
 # Add session management endpoints
 @app.get("/sessions")
@@ -268,3 +728,53 @@ async def clear_all_sessions():
         "success": True,
         "message": "All sessions cleared"
     })
+
+@app.get("/test-stream")
+async def test_stream():
+    """Test endpoint to verify streaming is working."""
+    async def generate_test_stream():
+        for i in range(10):
+            chunk = {
+                "id": f"test-{uuid4().hex}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": "test-model",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "content": f"Chunk {i+1} "
+                    },
+                    "finish_reason": None
+                }]
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
+            await asyncio.sleep(0.5)
+        
+        # Final chunk
+        final_chunk = {
+            "id": f"test-{uuid4().hex}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop"
+            }]
+        }
+        yield f"data: {json.dumps(final_chunk)}\n\n"
+        yield "data: [DONE]\n\n"
+    
+    return StreamingResponse(
+        generate_test_stream(),
+        media_type="text/plain",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Content-Type": "text/event-stream",
+        }
+    )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

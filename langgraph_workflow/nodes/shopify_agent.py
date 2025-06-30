@@ -11,14 +11,249 @@ from langchain_community.chat_models import ChatOpenAI
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from config import SHOP, ACCESS_TOKEN
 
+# Import functions from listing_database
+from .listing_database import validate_image_resolution, compress_image_url
+
+def select_products_with_llm(messages: List, search_results: List, user_query: str) -> List:
+    """
+    Use LLM to determine which products to list based on conversation context and user query.
+    """
+    if not search_results:
+        return []
+    
+    # Check if there are any recently modified products in the conversation
+    modified_products = []
+    for msg in messages[-5:]:  # Check last 5 messages for image modifications
+        if hasattr(msg, 'content'):
+            content = msg.content
+            if isinstance(content, str) and any(keyword in content.lower() for keyword in ['modified', 'changed', 'updated', 'processed', 'successfully']):
+                # Look for actual product SKUs in the message (not random URL strings)
+                import re
+                # Look for SKU patterns like W2640P257528, GS008004AAA, etc.
+                sku_pattern = r'\b[A-Z]{2}\d+[A-Z]*\b'
+                sku_matches = re.findall(sku_pattern, content)
+                # Filter out obvious non-SKUs (like URL fragments)
+                valid_skus = [sku for sku in sku_matches if len(sku) >= 8 and any(char.isdigit() for char in sku)]
+                modified_products.extend(valid_skus)
+    
+    # Use LLM-based selection for all cases - no hardcoded keyword matching
+    try:
+        # Build conversation context
+        conversation_parts = []
+        for msg in messages[-5:]:  # Only use last 5 messages to avoid old irrelevant context
+            if hasattr(msg, 'content'):
+                content = msg.content
+                if isinstance(content, list):
+                    # Handle multimodal content
+                    text_parts = []
+                    for item in content:
+                        if item.get("type") == "text":
+                            text_parts.append(item.get("text", ""))
+                    content = " ".join(text_parts)
+                # Only include messages that are relevant to product selection
+                if content.strip() and not content.startswith("✅") and not content.startswith("🔄"):
+                    conversation_parts.append(f"{'User' if hasattr(msg, 'type') and msg.type == 'human' else 'Assistant'}: {content}")
+        
+        conversation_context = "\n".join(conversation_parts)
+        
+        # Build product list with descriptive names
+        product_list = []
+        for i, product in enumerate(search_results, 1):
+            metadata = product.get('metadata', {})
+            sku = metadata.get('sku', '')
+            
+            # Create descriptive name from available fields
+            name_parts = []
+            if metadata.get('category'):
+                name_parts.append(metadata.get('category'))
+            if metadata.get('material'):
+                name_parts.append(metadata.get('material'))
+            if metadata.get('color'):
+                name_parts.append(metadata.get('color'))
+            if metadata.get('characteristics_text'):
+                name_parts.append(metadata.get('characteristics_text'))
+            
+            descriptive_name = " ".join(name_parts) if name_parts else f"Product {i}"
+            
+            product_info = f"{i}. SKU: {sku}, Name: {descriptive_name}"
+            if metadata.get('scene'):
+                product_info += f", Scene: {metadata.get('scene')}"
+            
+            # Mark recently modified products
+            if sku in modified_products:
+                product_info += " [RECENTLY MODIFIED]"
+            
+            product_list.append(product_info)
+        
+        product_list_text = "\n".join(product_list)
+        
+        llm = ChatOpenAI(model="gpt-4o", temperature=0.1)
+        
+        prompt = f"""You are an expert at understanding user intent for product selection in e-commerce workflows. Your task is to analyze the user's natural language request and determine which specific products they want to list on Shopify.
+
+CONVERSATION CONTEXT:
+{conversation_context}
+
+AVAILABLE PRODUCTS:
+{product_list_text}
+
+RECENTLY MODIFIED PRODUCTS: {modified_products}
+
+USER'S CURRENT QUERY:
+{user_query}
+
+TASK: Understand the user's intent and select the appropriate products for Shopify listing.
+
+ANALYSIS APPROACH:
+1. **Understand the user's intent**: What are they trying to accomplish?
+2. **Identify product references**: How are they referring to specific products?
+3. **Consider context**: What products have been discussed or modified recently?
+4. **Match characteristics**: What product attributes are they mentioning?
+
+INTENT UNDERSTANDING:
+- **Specific product request**: User mentions particular characteristics, SKU, or refers to a specific product
+- **Recent product reference**: User refers to recently discussed or modified products
+- **General category request**: User wants all products of a certain type
+- **All products request**: User explicitly wants everything
+
+PRODUCT REFERENCE PATTERNS:
+- **Direct SKU mention**: "W2103P277202", "SKU W1880115228"
+- **Characteristic matching**: "black chair", "yellow linen", "white plastic"
+- **Positional reference**: "the first one", "this product", "that chair"
+- **Contextual reference**: "the one we just modified", "the chair I liked"
+- **Category reference**: "all chairs", "every table", "chairs only"
+
+SELECTION LOGIC:
+1. **Exact SKU match**: If user mentions a specific SKU, select only that product
+2. **Characteristic match**: If user mentions specific attributes, find products matching ALL mentioned characteristics
+3. **Recent context**: If user refers to recently discussed/modified products, prioritize those
+4. **Category match**: If user mentions a product type, select all products of that type
+5. **Default behavior**: Only select all products if user explicitly requests everything
+
+EXAMPLES OF USER INTENTS:
+- "list only Patio Rocking Chair - White SKU: W2103P277202" → Select W2103P277202 only
+- "list the black hdpe chair" → Select black HDPE chairs only
+- "list this product" → Select most recently modified product
+- "list all chairs" → Select all chair products
+- "上架黑椅子" → Select black chairs only
+- "publish the yellow one" → Select yellow products only
+- "list everything" → Select all products
+
+Return a JSON response with:
+{{
+    "selected_skus": ["SKU1", "SKU2", ...],
+    "reasoning": "Detailed explanation of how you interpreted the user's intent and why these specific products were selected",
+    "confidence": 0.95
+}}
+
+If you cannot determine specific products, return an empty array for selected_skus and explain why.
+
+Response:"""
+
+        response = llm.invoke(prompt)
+        response_content = response.content.strip()
+        
+        # Better JSON parsing with fallback - handle markdown-wrapped JSON
+        try:
+            # Remove markdown code blocks if present
+            if response_content.startswith('```'):
+                # Extract content between code blocks
+                import re
+                json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response_content, re.DOTALL)
+                if json_match:
+                    response_content = json_match.group(1)
+                else:
+                    # Try to find JSON object in the response
+                    json_match = re.search(r'\{.*?\}', response_content, re.DOTALL)
+                    if json_match:
+                        response_content = json_match.group(0)
+            
+            result = json.loads(response_content)
+        except json.JSONDecodeError:
+            print(f"❌ JSON parsing failed, response was: {response_content}")
+            # Try to extract SKUs from the response text
+            import re
+            sku_matches = re.findall(r'\b[A-Z]{2}\d+[A-Z]*\b', response_content)
+            valid_skus = [sku for sku in sku_matches if len(sku) >= 8 and any(char.isdigit() for char in sku)]
+            if valid_skus:
+                result = {"selected_skus": valid_skus, "reasoning": "Extracted from text response", "confidence": 0.5}
+            else:
+                result = {"selected_skus": [], "reasoning": "JSON parsing failed", "confidence": 0.0}
+        
+        selected_skus = result.get("selected_skus", [])
+        reasoning = result.get("reasoning", "")
+        confidence = result.get("confidence", 0.0)
+        
+        print(f"🤖 LLM Product Selection:")
+        print(f"   Reasoning: {reasoning}")
+        print(f"   Selected SKUs: {selected_skus}")
+        print(f"   Confidence: {confidence}")
+        print(f"   Recently Modified Products: {modified_products}")
+        
+        if selected_skus:
+            # Filter products based on selected SKUs
+            filtered_products = []
+            for product in search_results:
+                sku = product.get('metadata', {}).get('sku', '')
+                if sku in selected_skus:
+                    filtered_products.append(product)
+            
+            if filtered_products:
+                return filtered_products
+            else:
+                print(f"⚠️ No matching products found for selected SKUs: {selected_skus}")
+                # If no matches but we have recently modified products, use those
+                if modified_products:
+                    print(f"🔄 Falling back to recently modified products: {modified_products}")
+                    modified_filtered = []
+                    for product in search_results:
+                        sku = product.get('metadata', {}).get('sku', '')
+                        if sku in modified_products:
+                            modified_filtered.append(product)
+                    if modified_filtered:
+                        return modified_filtered
+                return search_results  # Final fallback to all products
+        else:
+            print("🔍 No specific products selected")
+            # If no specific selection but we have recently modified products, use those
+            if modified_products:
+                print(f"🔄 Using recently modified products: {modified_products}")
+                modified_filtered = []
+                for product in search_results:
+                    sku = product.get('metadata', {}).get('sku', '')
+                    if sku in modified_products:
+                        modified_filtered.append(product)
+                if modified_filtered:
+                    return modified_filtered
+            print("🔍 Using all available products")
+            return search_results  # Use all products if no specific selection
+            
+    except Exception as e:
+        print(f"❌ Error in LLM product selection: {e}")
+        # Fallback to recently modified products if available
+        if modified_products:
+            print(f"🔄 Error fallback to recently modified products: {modified_products}")
+            modified_filtered = []
+            for product in search_results:
+                sku = product.get('metadata', {}).get('sku', '')
+                if sku in modified_products:
+                    modified_filtered.append(product)
+            if modified_filtered:
+                return modified_filtered
+        return search_results  # Final fallback to all products
+
 def shopify_agent_node(state):
     """
     Publishes selected products to Shopify with LLM-generated titles and descriptions.
+    Uses unified ProductSelectionIntentParser for product selection.
     """
     user_query = state.get("user_query", "")
     search_results = state.get("search_results", [])
     messages = state.get("messages", [])
-    parsed_intent = state.get("parsed_intent", {})
+    
+    # Detect language
+    is_chinese = any('\u4e00' <= char <= '\u9fff' for char in user_query)
+    language = "zh" if is_chinese else "en"
     
     print("🔄 Shopify Agent: Starting product publishing process...")
     
@@ -26,228 +261,245 @@ def shopify_agent_node(state):
     from .listing_database import ListingDatabase
     db = ListingDatabase()
     
-    # ALWAYS check listing database first - this is the primary source
+    # Get products from listing database (primary source)
     listing_ready_skus = db.list_products()
     
-    if listing_ready_skus:
-        print(f"📋 Found {len(listing_ready_skus)} products in listing database - using these as primary source")
-        
-        # Get products from listing database
-        listing_products = []
-        for sku in listing_ready_skus:
-            product_data = db.get_product(sku)
-            if product_data:
-                listing_products.append(product_data)
-        
-        if listing_products:
-            print(f"✅ Using {len(listing_products)} products from listing database")
-            # Use listing database products as primary source
-            working_search_results = []
-            for listing_product in listing_products:
-                # Create a mock search result from listing database entry
-                original_metadata = listing_product.get('original_metadata', {})
-                # Update the main image to the modified image (if it exists)
-                modified_image_url = listing_product.get('modified_image_url', '')
-                if modified_image_url:
-                    original_metadata['main_image_url'] = modified_image_url
-                    # Add the modified image to the image_urls list at the beginning
-                    image_urls = original_metadata.get('image_urls', [])
-                    if modified_image_url not in image_urls:
-                        image_urls.insert(0, modified_image_url)
-                        original_metadata['image_urls'] = image_urls
-                
-                working_search_results.append({
-                    'metadata': original_metadata,
-                    'id': f"{listing_product.get('sku')}_listing",
-                    'score': 1.0
-                })
-        else:
-            print("⚠️ No valid products found in listing database, falling back to search results")
-            working_search_results = search_results.copy() if search_results else []
-    else:
-        print("📋 No products in listing database, using search results as fallback")
-        # Create a copy of search results to work with, don't modify the original
-        working_search_results = search_results.copy() if search_results else []
-    
-    # Use parsed intent to determine which products to list
-    if working_search_results and parsed_intent:
-        selected_products = parsed_intent.get("selected_products", [])
-        selected_skus = parsed_intent.get("selected_skus", [])
-        reasoning = parsed_intent.get("reasoning", "")
-        confidence = parsed_intent.get("confidence", 0.0)
-        language = parsed_intent.get("language", "en")
-        
-        print(f"🔍 Intent Parser Results: {reasoning}")
-        print(f"🎯 Selected SKUs: {selected_skus}")
-        print(f"📊 Confidence: {confidence}")
-        print(f"🌐 Language: {language}")
-        
-        # Filter products based on intent parser results
-        if selected_skus:
-            filtered_results = []
-            for product in working_search_results:
-                sku = product.get('metadata', {}).get('sku', '')
-                if sku in selected_skus:
-                    filtered_results.append(product)
-            
-            if filtered_results:
-                working_search_results = filtered_results
-                print(f"✅ Filtered to {len(filtered_results)} products: {selected_skus}")
-            else:
-                print(f"⚠️ No matching products found for SKUs: {selected_skus}")
-        else:
-            print("🔍 No specific SKUs identified, using all available products")
-    else:
-        print("🔍 No intent parser results available, using all available products")
-        language = "en"
-    
-    if not working_search_results:
+    if not listing_ready_skus:
+        print("❌ No products found in listing database")
         return {
-            "messages": [HumanMessage(content="❌ No products found to publish to Shopify.")],
-            **state
+            **state,
+            "shopify_status": {"success": False, "message": "No products found in listing database. Please search for products first."}
         }
-    print(f"🔍 Found {len(working_search_results)} products to process for Shopify\n")
+    
+    print(f"📋 Found {len(listing_ready_skus)} products in listing database")
+    
+    # Get products from listing database
+    listing_products = []
+    for sku in listing_ready_skus:
+        product_data = db.get_product(sku)
+        if product_data:
+            listing_products.append(product_data)
+    
+    if not listing_products:
+        print("❌ No valid products found in listing database")
+        return {
+            **state,
+            "shopify_status": {"success": False, "message": "No valid products found in listing database."}
+        }
+    
+    # Convert listing database products to search result format for the parser
+    working_search_results = []
+    for listing_product in listing_products:
+        original_metadata = listing_product.get('original_metadata', {})
+        # Update the main image to the modified image (if it exists)
+        modified_image_url = listing_product.get('modified_image_url', '')
+        if modified_image_url:
+            original_metadata['main_image_url'] = modified_image_url
+            # Add the modified image to the image_urls list at the beginning
+            image_urls = original_metadata.get('image_urls', [])
+            if modified_image_url not in image_urls:
+                image_urls.insert(0, modified_image_url)
+                original_metadata['image_urls'] = image_urls
+        
+        working_search_results.append({
+            'metadata': original_metadata,
+            'id': f"{listing_product.get('sku')}_listing",
+            'score': 1.0
+        })
+    
+    # Build conversation context for the parser
+    conversation_parts = []
+    for msg in messages[-5:]:  # Only use last 5 messages to avoid old irrelevant context
+        if hasattr(msg, 'content'):
+            content = msg.content
+            if isinstance(content, list):
+                # Handle multimodal content
+                text_parts = []
+                for item in content:
+                    if item.get("type") == "text":
+                        text_parts.append(item.get("text", ""))
+                content = " ".join(text_parts)
+            # Only include messages that are relevant to product selection
+            if content.strip() and not content.startswith("✅") and not content.startswith("🔄"):
+                conversation_parts.append(f"{'User' if hasattr(msg, 'type') and msg.type == 'human' else 'Assistant'}: {content}")
+    
+    conversation_context = "\n".join(conversation_parts)
+    
+    # Use unified ProductSelectionIntentParser
+    from .intent_parser_agent import product_selection_parser
+    
+    print("🤖 Using unified ProductSelectionIntentParser for product selection...")
+    print(f"🔍 Debug - Current user query: '{user_query}'")
+    print(f"🔍 Debug - Conversation context length: {len(conversation_context)} characters")
+    if conversation_context:
+        print(f"🔍 Debug - Conversation context preview: {conversation_context[:200]}...")
+    
+    selection_result = product_selection_parser.parse_product_selection(
+        user_query=user_query,
+        available_products=working_search_results,
+        conversation_context=conversation_context
+    )
+    
+    selected_products = selection_result.get("selected_products", [])
+    selected_skus = selection_result.get("selected_skus", [])
+    reasoning = selection_result.get("reasoning", "")
+    confidence = selection_result.get("confidence", 0.0)
+    
+    print(f"🤖 Product Selection Result:")
+    print(f"   Reasoning: {reasoning}")
+    print(f"   Selected SKUs: {selected_skus}")
+    print(f"   Confidence: {confidence}")
+    
+    if not selected_products:
+        print("❌ No products selected for listing")
+        return {
+            **state,
+            "shopify_status": {"success": False, "message": f"No products selected. {reasoning}"}
+        }
+    
+    print(f"🔍 Found {len(selected_products)} products to process for Shopify")
 
     # Deduplicate by SKU
-    unique_products = {}
-    for match in working_search_results:
-        metadata = match.get('metadata', {})
-        sku = metadata.get('sku')
-        if sku and sku not in unique_products:
-            unique_products[sku] = match
-    print(f"📦 Deduplicated to {len(unique_products)} unique products by SKU\n")
-
+    unique_products = []
+    seen_skus = set()
+    for product in selected_products:
+        sku = product.get('metadata', {}).get('sku', '')
+        if sku and sku not in seen_skus:
+            unique_products.append(product)
+            seen_skus.add(sku)
+    
+    print(f"📦 Deduplicated to {len(unique_products)} unique products by SKU")
+    
+    # Process each product for Shopify listing
     successful_products = []
     failed_products = []
-    product_links = []
-    for idx, (sku, match) in enumerate(unique_products.items(), 1):
-        metadata = match.get('metadata', {})
-        print(f"🔄 Processing product {idx}/{len(unique_products)}: {sku}")
+    
+    for i, product in enumerate(unique_products, 1):
+        metadata = product.get('metadata', {})
+        sku = metadata.get('sku', '')
+        
+        print(f"🔄 Processing product {i}/{len(unique_products)}: {sku}")
+        
         try:
-            # NEW: Generate AI-written title and description
-            llm = ChatOpenAI(model="gpt-4o", temperature=0.7, request_timeout=15)
-            
-            # Prepare product data for LLM
-            product_data = f"""
-SKU: {metadata.get('sku', 'N/A')}
-Category: {metadata.get('category', 'N/A')}
-Material: {metadata.get('material', 'N/A')}
-Color: {metadata.get('color', 'N/A')}
-Features: {metadata.get('characteristics_text', 'N/A')}
-Dimensions: Height: {metadata.get('height', 'N/A')}", Width: {metadata.get('width', 'N/A')}", Length: {metadata.get('length', 'N/A')}"
-Weight: {metadata.get('weight', 'N/A')} lbs
-Scene: {metadata.get('scene', 'N/A')}
-"""
-            
-            # Generate title
-            title_prompt = f"""
-Create a compelling, SEO-friendly product title for this item. Make it attractive and descriptive.
-
-Product Information:
-{product_data}
-
-Requirements:
-- Keep it under 100 characters
-- Include key features like material, color, or type
-- Make it appealing to customers
-- Don't include SKU in the title
-- Be specific and descriptive
-
-Title:"""
-            
-            title_response = llm.invoke(title_prompt)
-            ai_title = title_response.content.strip().strip('"').strip("'")
-            
-            # Generate description
-            desc_prompt = f"""
-Create a compelling product description for this item. Make it engaging and informative.
-
-Product Information:
-{product_data}
-
-Requirements:
-- Write 2-3 paragraphs
-- Highlight key features and benefits
-- Make it appealing to customers
-- Include practical use cases
-- Be enthusiastic but professional
-- Don't include SKU in the description
-
-Description:"""
-            
-            desc_response = llm.invoke(desc_prompt)
-            ai_description = desc_response.content.strip()
+            # Generate AI title and description
+            ai_title = generate_ai_title(metadata, language)
+            ai_description = generate_ai_description(metadata, language)
             
             print(f"🤖 Generated AI Title: {ai_title}")
             print(f"🤖 Generated AI Description: {ai_description[:100]}...")
             
-            # Create product input with AI-generated content
-            product_input = create_product_input_from_metadata(metadata, ai_title, ai_description)
-            # NEW: Pass modified_images to create_media_from_metadata
-            media = create_media_from_metadata(metadata, [])
-            result = publish_product_to_shopify(product_input, media, metadata)
-            if result.get('success'):
-                successful_products.append(result)
-                print(f"✅ Successfully published: {result.get('title', sku)}\n")
-                # After publishing each product, collect the Shopify product link and title
-                shopify_url = result.get('live_url') or result.get('shopify_url') or result.get('url')
-                title = result.get('title', ai_title)
-                if shopify_url:
-                    product_links.append({'title': title, 'url': shopify_url})
-                    print(f"🔗 Added product link: {title} -> {shopify_url}")
+            # Check listing database for modified images
+            print(f"🔍 Debug - Checking listing database for SKU {sku}")
+            listing_product = db.get_product(sku)
+            print(f"🔍 Debug - Listing product found: {listing_product is not None}")
+            
+            if listing_product:
+                print(f"🔍 Debug - Listing product keys: {list(listing_product.keys())}")
+                listing_images = listing_product.get('listing_images', {})
+                print(f"🔍 Debug - Has listing_images: {listing_images is not None}")
+                
+                if listing_images:
+                    print(f"🔍 Debug - listing_images keys: {list(listing_images.keys())}")
+                    all_images = listing_images.get('all_images', [])
+                    print(f"🔍 Debug - all_images count: {len(all_images)}")
+                    
+                    if all_images:
+                        print(f"🎨 Shopify Agent: Using {len(all_images)} images from listing database for SKU {sku}")
+                        primary_image = listing_images.get('primary_image', '')
+                        print(f"🎨 Primary image: {primary_image}")
+                        
+                        # Format media for Shopify API
+                        media = [
+                            {"originalSource": image_url, "mediaContentType": "IMAGE"}
+                            for image_url in all_images
+                        ]
+                        
+                        print(f"📸 Final media count for SKU {sku}: {len(media)} images")
+                    else:
+                        print(f"⚠️ No images found in listing database for SKU {sku}")
+                        media = create_media_from_metadata(metadata)
                 else:
-                    print(f"⚠️ No URL found for published product: {title}")
+                    print(f"⚠️ No listing_images found for SKU {sku}")
+                    media = create_media_from_metadata(metadata)
             else:
-                failed_products.append({"sku": sku, "error": result.get('error', 'Unknown error')})
-                print(f"❌ Failed to publish: {sku} - {result.get('error', 'Unknown error')}\n")
+                print(f"⚠️ No listing database entry found for SKU {sku}")
+                media = create_media_from_metadata(metadata)
+            
+            # Create product input
+            product_input = create_product_input_from_metadata(metadata, ai_title, ai_description)
+            
+            # Publish to Shopify
+            result = publish_product_to_shopify(product_input, media, metadata)
+            
+            if result.get("success"):
+                print(f"✅ Successfully published: {ai_title}")
+                successful_products.append({
+                    "title": ai_title,
+                    "url": result.get("live_url", ""),
+                    "sku": sku
+                })
+            else:
+                error_msg = result.get("error", "Unknown error")
+                print(f"❌ Failed to publish: {ai_title}")
+                print(f"❌ Error details: {error_msg}")
+                failed_products.append({
+                    "title": ai_title,
+                    "error": error_msg,
+                    "sku": sku
+                })
+                
         except Exception as e:
-            failed_products.append({"sku": sku, "error": str(e)})
-            print(f"❌ Exception for {sku}: {e}\n")
-
-    # After all products processed, generate a friendly LLM message if at least one was successful
-    print(f"🔍 Debug - product_links count: {len(product_links)}")
-    print(f"🔍 Debug - product_links content: {product_links}")
-    if product_links:
-        llm = ChatOpenAI(model="gpt-4o", temperature=0.3, request_timeout=10)
-        links_str = "\n".join([f"- {p['title']}: {p['url']}" for p in product_links])
-        
-        # Generate language-appropriate prompt
-        if language == "zh" or language == "zh-cn":
-            prompt = f"""
-你刚刚帮助用户将产品上架到Shopify。以下是产品标题和链接：
-{links_str}
-用中文写一个友好的祝贺消息给用户，列出每个产品及其标题和链接。要简洁且热情。
-"""
-        else:
-            prompt = f"""
-You just helped a user list products on Shopify. Here are the product titles and their links:
-{links_str}
-Write a friendly, congratulatory message to the user, listing each product with its title and link. Be concise and enthusiastic.
-"""
-        
-        llm_message = llm.invoke(prompt).content
-        state = dict(state)
-        state["messages"] = state.get("messages", []) + [AIMessage(content=llm_message)]
-        # CRITICAL: Don't modify search_results in the returned state
-        # Keep the original search_results so they don't get overwritten in global state
-        print("🔍 Shopify Agent - Final messages list:")
-        for i, m in enumerate(state["messages"]):
-            print(f"{i}: {getattr(m, 'content', m)} (type: {getattr(m, 'type', None)}, role: {getattr(m, 'role', None)})")
-        return state
+            print(f"❌ Error processing product {sku}: {e}")
+            failed_products.append({
+                "title": f"Product {sku}",
+                "error": str(e),
+                "sku": sku
+            })
     
-    # If no products were successfully published, return failure message
-    if language == "zh" or language == "zh-cn":
-        success_message = "❌ 没有产品成功上架到Shopify。"
+    # Generate response
+    response = generate_shopify_response(successful_products, failed_products, len(unique_products))
+    
+    # Format successful products for streaming response
+    product_links = []
+    for product in successful_products:
+        product_links.append({
+            "title": product["title"],
+            "url": product.get("url", ""),
+            "sku": product["sku"]
+        })
+    
+    # Create streaming-friendly response message
+    if successful_products:
+        # Success response with product links
+        response_message = f"🎉 Successfully listed {len(successful_products)} product(s) on Shopify!\n\n"
+        for i, product in enumerate(successful_products, 1):
+            response_message += f"**{i}. {product['title']}**\n"
+            response_message += f"SKU: {product['sku']}\n"
+            if product.get('url'):
+                response_message += f"🔗 [View on Shopify]({product['url']})\n"
+            response_message += "\n"
+        
+        if failed_products:
+            response_message += f"⚠️ {len(failed_products)} product(s) failed to list:\n"
+            for product in failed_products:
+                response_message += f"- {product['title']}: {product.get('error', 'Unknown error')}\n"
     else:
-        success_message = "❌ No products were successfully published to Shopify."
+        # Failure response
+        response_message = f"❌ Failed to list any products on Shopify.\n\n"
+        for product in failed_products:
+            response_message += f"- {product['title']}: {product.get('error', 'Unknown error')}\n"
     
-    state = dict(state)
-    state["messages"] = state.get("messages", []) + [AIMessage(content=success_message)]
-    # CRITICAL: Don't modify search_results in the returned state
-    print("🔍 Shopify Agent - Final messages list:")
-    for i, m in enumerate(state["messages"]):
-        print(f"{i}: {getattr(m, 'content', m)} (type: {getattr(m, 'type', None)}, role: {getattr(m, 'role', None)})")
-    return state
+    return {
+        **state,
+        "shopify_status": {
+            "success": len(successful_products) > 0,
+            "message": response,
+            "successful_count": len(successful_products),
+            "failed_count": len(failed_products)
+        },
+        "product_links": product_links,
+        "messages": [AIMessage(content=response_message)]
+    }
 
 def create_product_input_from_metadata(metadata: Dict[str, Any], ai_title: str, ai_description: str) -> Dict[str, Any]:
     """Create Shopify product input from vector search metadata"""
@@ -258,46 +510,6 @@ def create_product_input_from_metadata(metadata: Dict[str, Any], ai_title: str, 
     
     # Create HTML description with AI-generated content
     description_html = create_description_html(metadata, ai_description)
-    
-    return {
-        "title": title,
-        "descriptionHtml": description_html,
-        "productType": metadata.get('category', 'General'),
-        "vendor": metadata.get('vendor', 'Default Vendor'),
-        "status": "ACTIVE"
-    }
-
-    # Add category if available
-    category = metadata.get('category', '')
-    if category:
-        title_parts.append(category)
-    
-    # Add material if available
-    material = metadata.get('material', '')
-    if material:
-        title_parts.append(material)
-    
-    # Add color if available
-    color = metadata.get('color', '')
-    if color:
-        title_parts.append(color)
-    
-    # Add SKU if available
-    sku = metadata.get('sku', '')
-    if sku:
-        title_parts.append(f"({sku})")
-    
-    # Create title
-    if title_parts:
-        title = " ".join(title_parts)
-    else:
-        title = f"Product {sku}" if sku else "Product"
-    
-    # Create description from characteristics_text if available
-    description = metadata.get('characteristics_text', metadata.get('description', ''))
-    
-    # Create HTML description if we have structured data
-    description_html = create_description_html(metadata)
     
     return {
         "title": title,
@@ -426,30 +638,37 @@ def create_specifications_table(specs: Dict[str, str]) -> str:
     '''
 
 def create_media_from_metadata(metadata: Dict[str, Any], modified_images: List[Dict] = None) -> List[Dict[str, str]]:
-    """Create media array from metadata, including modified images if available"""
+    """
+    Create a list of media dicts for Shopify from product metadata and modified images.
+    Ensures all images are under 25MP and compresses if needed.
+    The modified image (if present) is always the primary image.
+    """
     media = []
-    
-    # Get all images from the new structure
-    image_urls = metadata.get('image_urls', [])
-    main_image_url = metadata.get('main_image_url', '')
     sku = metadata.get('sku', '')
-    
-    # NEW: Check if we have modified images for this SKU
+    main_image_url = metadata.get('main_image_url', '')
+    image_urls = metadata.get('image_urls', [])
     modified_image_url = None
     if modified_images:
-        for img_result in modified_images:
-            if img_result.get('sku') == sku and img_result.get('status') == 'success':
-                modified_image_url = img_result.get('modified_image_url')
-                break
-    
-    # If we have a modified image, use it as the main image
+        # Use the most recent modified image as primary
+        modified_image_url = modified_images[0]["url"] if modified_images else None
+
+    # Add modified image as primary if present
     if modified_image_url:
+        # Validate and compress image resolution
+        is_valid, validation_msg = validate_image_resolution(modified_image_url)
+        if not is_valid:
+            print(f"⚠️ Warning: Modified image for SKU {sku} exceeds 25MP limit: {validation_msg}")
+            print(f"🔄 Compressing modified image before Shopify upload...")
+            compressed_url = compress_image_url(modified_image_url)
+            if compressed_url != modified_image_url:
+                print(f"✅ Modified image compressed successfully for Shopify upload")
+                modified_image_url = compressed_url
         media.append({
             "originalSource": modified_image_url,
             "mediaContentType": "IMAGE"
         })
         print(f"🎨 Shopify Agent: Using modified image for SKU {sku}: {modified_image_url}")
-    
+
     # Add original images (but skip the main one if we're using a modified version)
     if image_urls:
         for img_url in image_urls:
@@ -457,17 +676,34 @@ def create_media_from_metadata(metadata: Dict[str, Any], modified_images: List[D
                 # Skip the main image if we're using a modified version
                 if modified_image_url and img_url.strip() == main_image_url:
                     continue
+                # Validate and compress image resolution
+                is_valid, validation_msg = validate_image_resolution(img_url)
+                if not is_valid:
+                    print(f"⚠️ Warning: Original image for SKU {sku} exceeds 25MP limit: {validation_msg}")
+                    print(f"🔄 Compressing original image before Shopify upload...")
+                    compressed_url = compress_image_url(img_url)
+                    if compressed_url != img_url:
+                        print(f"✅ Original image compressed successfully for Shopify upload")
+                        img_url = compressed_url
                 media.append({
                     "originalSource": img_url.strip(),
                     "mediaContentType": "IMAGE"
                 })
     # Fallback to main_image_url if image_urls is not available and no modified image
     elif main_image_url and not modified_image_url:
+        # Validate and compress image resolution
+        is_valid, validation_msg = validate_image_resolution(main_image_url)
+        if not is_valid:
+            print(f"⚠️ Warning: Main image for SKU {sku} exceeds 25MP limit: {validation_msg}")
+            print(f"🔄 Compressing main image before Shopify upload...")
+            compressed_url = compress_image_url(main_image_url)
+            if compressed_url != main_image_url:
+                print(f"✅ Main image compressed successfully for Shopify upload")
+                main_image_url = compressed_url
         media.append({
             "originalSource": main_image_url,
             "mediaContentType": "IMAGE"
         })
-    
     # Remove duplicates while preserving order
     seen_urls = set()
     unique_media = []
@@ -475,7 +711,7 @@ def create_media_from_metadata(metadata: Dict[str, Any], modified_images: List[D
         if item["originalSource"] not in seen_urls:
             unique_media.append(item)
             seen_urls.add(item["originalSource"])
-    
+    print(f"📸 Final media count for SKU {sku}: {len(unique_media)} images")
     return unique_media
 
 def publish_product_to_shopify(product_input: Dict[str, Any], media: List[Dict[str, str]], metadata: Dict[str, Any]) -> Dict[str, Any]:
@@ -484,6 +720,9 @@ def publish_product_to_shopify(product_input: Dict[str, Any], media: List[Dict[s
     Returns: {'success': bool, 'title': str, 'live_url': str, 'product_id': str, 'error': str}
     """
     try:
+        print(f"🔄 Starting Shopify publish for product: {product_input.get('title', 'Unknown')}")
+        print(f"🔄 Media count: {len(media)}")
+        
         url = f"https://{SHOP}/admin/api/2025-04/graphql.json"
         headers = {
             "Content-Type": "application/json",
@@ -491,6 +730,7 @@ def publish_product_to_shopify(product_input: Dict[str, Any], media: List[Dict[s
         }
         
         # Step 1: Get Online Store publication ID
+        print("🔄 Step 1: Getting Online Store publication ID...")
         publications_query = """
         query {
           publications(first: 10) {
@@ -507,6 +747,9 @@ def publish_product_to_shopify(product_input: Dict[str, Any], media: List[Dict[s
         resp = requests.post(url, headers=headers, json={"query": publications_query})
         result = resp.json()
         
+        if result.get("errors"):
+            raise Exception(f"Publications query error: {result['errors']}")
+        
         # Find the Online Store publication
         publication_id = None
         for edge in result["data"]["publications"]["edges"]:
@@ -517,7 +760,10 @@ def publish_product_to_shopify(product_input: Dict[str, Any], media: List[Dict[s
         if not publication_id:
             raise Exception("Online Store publication ID not found!")
         
+        print(f"✅ Found publication ID: {publication_id}")
+        
         # Step 2: Create Product
+        print("🔄 Step 2: Creating product...")
         create_product_query = """
         mutation productCreate($input: ProductInput!, $media: [CreateMediaInput!]) {
           productCreate(input: $input, media: $media) {
@@ -537,8 +783,10 @@ def publish_product_to_shopify(product_input: Dict[str, Any], media: List[Dict[s
             raise Exception(f"Product creation user errors: {result['data']['productCreate']['userErrors']}")
         
         product_id = result["data"]["productCreate"]["product"]["id"]
+        print(f"✅ Product created with ID: {product_id}")
         
         # Step 3: Publish the product
+        print("🔄 Step 3: Publishing product...")
         publish_mutation = """
         mutation publishProduct($id: ID!, $input: [PublicationInput!]!) {
           publishablePublish(id: $id, input: $input) {
@@ -572,7 +820,10 @@ def publish_product_to_shopify(product_input: Dict[str, Any], media: List[Dict[s
         if publish_data.get("userErrors"):
             raise Exception(f"Publish user errors: {publish_data['userErrors']}")
         
+        print("✅ Product published successfully")
+        
         # Step 4: Get default location ID
+        print("🔄 Step 4: Getting location ID...")
         locations_query = """
         query {
           locations(first: 10) {
@@ -595,8 +846,10 @@ def publish_product_to_shopify(product_input: Dict[str, Any], media: List[Dict[s
             raise Exception("No locations found")
         
         location_id = locations_data[0]["node"]["id"]
+        print(f"✅ Found location ID: {location_id}")
         
         # Step 5: Update variant with SKU, price, and inventory
+        print("🔄 Step 5: Updating variant...")
         sku = metadata.get('sku', 'DEFAULT-SKU')
         price = metadata.get('price', '100.00')
         
@@ -643,7 +896,10 @@ def publish_product_to_shopify(product_input: Dict[str, Any], media: List[Dict[s
         if update_variant_data.get("userErrors"):
             raise Exception(f"Variant update user errors: {update_variant_data['userErrors']}")
         
+        print("✅ Variant updated successfully")
+        
         # Step 6: Get the live product URL
+        print("🔄 Step 6: Getting product URL...")
         get_product_query = """
         query getProduct($id: ID!) {
           product(id: $id) {
@@ -668,6 +924,8 @@ def publish_product_to_shopify(product_input: Dict[str, Any], media: List[Dict[s
         else:
             live_url = f"https://{SHOP}/products/{handle}"
         
+        print(f"✅ Product URL: {live_url}")
+        
         return {
             'success': True,
             'title': product_input['title'],
@@ -679,112 +937,137 @@ def publish_product_to_shopify(product_input: Dict[str, Any], media: List[Dict[s
         }
         
     except Exception as e:
+        print(f"❌ Shopify publish failed: {str(e)}")
         return {
             'success': False,
             'title': product_input.get('title', 'Unknown'),
             'error': str(e)
         }
 
-def generate_shopify_response(successful_products: List[Dict], failed_products: List[Dict], total_count: int) -> str:
-    """Generate a conversational, friendly response about the Shopify publishing results using LLM"""
-    
-    if not successful_products and not failed_products:
-        return "❌ No products were processed for Shopify publishing."
-    
-    # Prepare product details for LLM
-    product_details = []
-    for i, product in enumerate(successful_products, 1):
-        if 'shopify_result' in product:
-            result = product['shopify_result']
-        else:
-            result = product
-            
-        product_details.append({
-            "title": result.get('title', 'Unknown Product'),
-            "sku": result.get('sku', 'N/A'),
-            "price": result.get('price', 'N/A'),
-            "live_url": result.get('live_url', 'N/A'),
-            "admin_url": result.get('admin_url', 'N/A')
-        })
-    
-    # Prepare error details
-    error_details = []
-    for product in failed_products:
-        original_product = product['product']
-        error = product['error']
-        sku = original_product.get('metadata', {}).get('sku', 'Unknown SKU')
-        name = original_product.get('metadata', {}).get('name', 'Unknown Product')
-        error_details.append({
-            "name": name,
-            "sku": sku,
-            "error": error
-        })
-    
-    # Use LLM to generate friendly response
+def generate_ai_title(metadata: Dict[str, Any], language: str = "en") -> str:
+    """Generate AI-written product title."""
     llm = ChatOpenAI(model="gpt-4o", temperature=0.7, request_timeout=15)
     
-    prompt = f"""
-You are a helpful e-commerce assistant. The user just listed some products on Shopify. Generate a friendly, conversational response that:
-
-1. Confirms the products were successfully listed
-2. Presents the live product URLs in a natural, clickable way
-3. Asks if they want to make any changes or need help with anything else
-4. Be enthusiastic and helpful
-
-Here are the successfully listed products:
-{json.dumps(product_details, indent=2)}
-
-Here are any failed products (if any):
-{json.dumps(error_details, indent=2)}
-
-Total products processed: {total_count}
-Successfully listed: {len(successful_products)}
-Failed: {len(failed_products)}
-
-Generate a friendly, conversational response. Make the URLs clickable by formatting them as markdown links. Be enthusiastic about their success and offer to help with anything else they might need.
+    product_data = f"""
+SKU: {metadata.get('sku', 'N/A')}
+Category: {metadata.get('category', 'N/A')}
+Material: {metadata.get('material', 'N/A')}
+Color: {metadata.get('color', 'N/A')}
+Features: {metadata.get('characteristics_text', 'N/A')}
+Dimensions: Height: {metadata.get('height', 'N/A')}\", Width: {metadata.get('width', 'N/A')}\", Length: {metadata.get('length', 'N/A')}\"
+Weight: {metadata.get('weight', 'N/A')} lbs
+Scene: {metadata.get('scene', 'N/A')}
 """
     
-    try:
-        response = llm.invoke(prompt)
-        final_response = response.content
-        
-        # Debug: Print the response being generated
-        print("🔍 Debug - LLM Generated Shopify Response:")
-        print(final_response)
-        print("🔍 Debug - Response length:", len(final_response))
-        
-        return final_response
-        
-    except Exception as e:
-        # Fallback to original format if LLM fails
-        print(f"🔍 Debug - LLM failed, using fallback response: {e}")
-        
-        response_parts = []
-        response_parts.append(f"🎉 **Shopify Publishing Results**")
-        response_parts.append(f"📊 **Summary:** {len(successful_products)}/{total_count} products successfully published")
-        
-        if successful_products:
-            response_parts.append(f"\n✅ **Successfully Published Products:**")
-            for i, product in enumerate(successful_products, 1):
-                if 'shopify_result' in product:
-                    result = product['shopify_result']
-                else:
-                    result = product
-                    
-                response_parts.append(f"\n{i}. **{result['title']}**")
-                response_parts.append(f"   • SKU: {result.get('sku', 'N/A')}")
-                response_parts.append(f"   • Price: ${result.get('price', 'N/A')}")
-                response_parts.append(f"   • Live URL: {result.get('live_url', 'N/A')}")
-                response_parts.append(f"   • Admin URL: {result.get('admin_url', 'N/A')}")
-        
-        if failed_products:
-            response_parts.append(f"\n❌ **Failed Products:**")
-            for i, product in enumerate(failed_products, 1):
-                original_product = product['product']
-                error = product['error']
-                sku = original_product.get('metadata', {}).get('sku', 'Unknown SKU')
-                name = original_product.get('metadata', {}).get('name', 'Unknown Product')
-                response_parts.append(f"\n{i}. **{name}** (SKU: {sku})")
-                response_parts.append(f"   • Error: {error}")
-        
-        return '\n'.join(response_parts)
+    if language == "zh":
+        title_prompt = f"""
+为这个产品创建一个吸引人的、SEO友好的产品标题。让它具有吸引力且描述性强。
+
+产品信息:
+{product_data}
+
+要求:
+- 保持在100个字符以内
+- 包含关键特性，如材质、颜色或类型
+- 对客户有吸引力
+- 不要在标题中包含SKU
+- 要具体且描述性强
+
+标题:"""
+    else:
+        title_prompt = f"""
+Create a compelling, SEO-friendly product title for this item. Make it attractive and descriptive.
+
+Product Information:
+{product_data}
+
+Requirements:
+- Keep it under 100 characters
+- Include key features like material, color, or type
+- Make it appealing to customers
+- Don't include SKU in the title
+- Be specific and descriptive
+
+Title:"""
+    
+    title_response = llm.invoke(title_prompt)
+    return title_response.content.strip().strip('"').strip("'")
+
+def generate_ai_description(metadata: Dict[str, Any], language: str = "en") -> str:
+    """Generate AI-written product description."""
+    llm = ChatOpenAI(model="gpt-4o", temperature=0.7, request_timeout=15)
+    
+    product_data = f"""
+SKU: {metadata.get('sku', 'N/A')}
+Category: {metadata.get('category', 'N/A')}
+Material: {metadata.get('material', 'N/A')}
+Color: {metadata.get('color', 'N/A')}
+Features: {metadata.get('characteristics_text', 'N/A')}
+Dimensions: Height: {metadata.get('height', 'N/A')}\", Width: {metadata.get('width', 'N/A')}\", Length: {metadata.get('length', 'N/A')}\"
+Weight: {metadata.get('weight', 'N/A')} lbs
+Scene: {metadata.get('scene', 'N/A')}
+"""
+    
+    if language == "zh":
+        desc_prompt = f"""
+为这个产品创建一个吸引人的产品描述。让它引人入胜且信息丰富。
+
+产品信息:
+{product_data}
+
+要求:
+- 写2-3段
+- 突出关键特性和优势
+- 对客户有吸引力
+- 包含实际使用场景
+- 热情但专业
+- 不要在描述中包含SKU
+
+描述:"""
+    else:
+        desc_prompt = f"""
+Create a compelling product description for this item. Make it engaging and informative.
+
+Product Information:
+{product_data}
+
+Requirements:
+- Write 2-3 paragraphs
+- Highlight key features and benefits
+- Make it appealing to customers
+- Include practical use cases
+- Be enthusiastic but professional
+- Don't include SKU in the description
+
+Description:"""
+    
+    desc_response = llm.invoke(desc_prompt)
+    return desc_response.content.strip()
+
+def generate_shopify_response(successful_products: List[Dict], failed_products: List[Dict], total_count: int) -> str:
+    """Generate a friendly response message for Shopify listing results."""
+    if not successful_products:
+        return "❌ No products were successfully published to Shopify."
+    
+    llm = ChatOpenAI(model="gpt-4o", temperature=0.3, request_timeout=10)
+    
+    # Check if any product has Chinese characters to determine language
+    has_chinese = any('\u4e00' <= char <= '\u9fff' for char in str(successful_products))
+    language = "zh" if has_chinese else "en"
+    
+    links_str = "\n".join([f"- {p['title']}: {p['url']}" for p in successful_products])
+    
+    if language == "zh":
+        prompt = f"""
+你刚刚帮助用户将产品上架到Shopify。以下是产品标题和链接：
+{links_str}
+用中文写一个友好的祝贺消息给用户，列出每个产品及其标题和链接。要简洁且热情。
+"""
+    else:
+        prompt = f"""
+You just helped a user list products on Shopify. Here are the product titles and their links:
+{links_str}
+Write a friendly, congratulatory message to the user, listing each product with its title and link. Be concise and enthusiastic.
+"""
+    
+    return llm.invoke(prompt).content
