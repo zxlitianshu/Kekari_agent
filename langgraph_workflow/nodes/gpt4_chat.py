@@ -29,6 +29,35 @@ def extract_text_from_multimodal_content(content):
     return str(content)
 
 def gpt4_chat_node(state):
+    # Fallback: If error or gpt_fallback is set, generate a helpful message
+    if state.get('error') or state.get('plan_action') == 'gpt_fallback':
+        print('🛑 GPT Chat Node: Detected error or fallback trigger, generating fallback message.')
+        messages = state.get('messages', [])
+        chat_log = []
+        for m in messages:
+            if hasattr(m, 'content'):
+                role = getattr(m, 'role', None) or getattr(m, 'type', None) or 'user'
+                chat_log.append(f"{role}: {m.content}")
+        chat_log_str = '\n'.join(chat_log[-10:])  # Last 10 messages
+        error_info = state.get('error_info', 'An error or unexpected situation occurred in the workflow.')
+        prompt = f"""
+You are a helpful assistant. The previous step in the workflow failed or did not produce a useful result. Here is the recent chat log and system state:
+
+---
+{chat_log_str}
+---
+
+Error info: {error_info}
+
+Please:
+- Apologize to the user for the issue,
+- Briefly summarize what happened,
+- Offer helpful next steps (e.g., retry, clarify, try a different action).
+"""
+        llm = ChatOpenAI(model="gpt-4o", temperature=0.3)
+        response = llm.invoke(prompt)
+        return {"messages": [AIMessage(content=response.content)]}
+    
     # Extract text from multimodal content properly
     user_query = extract_text_from_multimodal_content(state["messages"][-1].content)
     

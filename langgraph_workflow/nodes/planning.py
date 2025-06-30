@@ -30,6 +30,11 @@ def extract_text_from_multimodal_content(content):
     return str(content)
 
 def planning_node(state):
+    # If plan_action is already set by a previous node, honor it and route immediately
+    if "plan_action" in state and state["plan_action"] not in (None, ""): 
+        print(f"[Planning Node] Detected pre-set plan_action: {state['plan_action']}, routing immediately.")
+        return state
+    
     # Get the last message and extract text properly
     last_message = state["messages"][-1]
     user_query = extract_text_from_multimodal_content(last_message.content)

@@ -704,56 +704,14 @@ def _process_product_images(agent: ImageAgent, state: Dict, modification_request
     
     # Use LLM to identify which specific product/SKU the user is referring to
     identified_sku = _identify_sku_with_llm(user_query, search_results, state.get("messages", []))
-    
+
     if not identified_sku:
-        # Could not identify a specific SKU, show all products and ask for clarification
+        # Could not identify a SKU at all
         is_chinese = any('\u4e00' <= char <= '\u9fff' for char in user_query)
-        
         if is_chinese:
-            response_text = f"""🤔 **需要确定具体产品**
-
-我理解你想要修改图片：*"{user_query}"*
-
-但是我无法确定你指的是哪个具体产品。以下是可用的产品：
-
-"""
-            
-            for i, product in enumerate(search_results, 1):
-                sku = product.get('metadata', {}).get('sku', 'N/A')
-                name = product.get('metadata', {}).get('name', 'N/A')
-                response_text += f"{i}. **SKU:** {sku} - {name}\n"
-            
-            response_text += f"""
-
-**请明确指定：**
-- "第一个沙发" 或 "第二个产品"
-- "黑色的桌子" 或 "木制椅子"
-- 直接说SKU号，比如 "GS008004AAA"
-
-然后我会帮你修改那个产品的图片！"""
+            response_text = f"""❌ **无法识别产品**\n\n我无法确定你要修改哪个产品。请明确指定产品或SKU。"""
         else:
-            response_text = f"""🤔 **Need to Identify Specific Product**
-
-I understand you want to modify images: *"{user_query}"*
-
-But I cannot determine which specific product you're referring to. Here are the available products:
-
-"""
-            
-            for i, product in enumerate(search_results, 1):
-                sku = product.get('metadata', {}).get('sku', 'N/A')
-                name = product.get('metadata', {}).get('name', 'N/A')
-                response_text += f"{i}. **SKU:** {sku} - {name}\n"
-            
-            response_text += f"""
-
-**Please specify clearly:**
-- "The first sofa" or "The second product"
-- "The black table" or "The wooden chair"
-- Or directly mention the SKU, like "GS008004AAA"
-
-Then I'll help you modify that product's image!"""
-        
+            response_text = f"""❌ **Could Not Identify Product**\n\nI couldn't determine which product you want to modify. Please specify a product or SKU."""
         return {
             **state,
             "modified_images": [],
@@ -762,30 +720,25 @@ Then I'll help you modify that product's image!"""
             "awaiting_confirmation": False
         }
 
-    # Find the identified product
+    # Only look up the product in the listing database
     target_product = None
-    for product in search_results:
-        if product.get('metadata', {}).get('sku') == identified_sku:
-            target_product = product
-            break
+    try:
+        from .listing_database import ListingDatabase
+        db = ListingDatabase()
+        listing_product = db.get_product(identified_sku)
+        if listing_product and listing_product.get('original_metadata'):
+            print(f"🔍 Found SKU {identified_sku} in listing database.")
+            target_product = {'metadata': listing_product['original_metadata']}
+    except Exception as e:
+        print(f"⚠️ Error checking listing database for SKU {identified_sku}: {e}")
     
     if not target_product:
-        # SKU not found in current search results
+        # SKU not found in listing database
         is_chinese = any('\u4e00' <= char <= '\u9fff' for char in user_query)
-        
         if is_chinese:
-            response_text = f"""❌ **产品未找到**
-
-抱歉，我在当前搜索结果中找不到SKU为 **{identified_sku}** 的产品。
-
-请重新搜索产品，或者指定一个可用的产品。"""
+            response_text = f"""❌ **产品未找到**\n\n抱歉，我在上架数据库中找不到SKU为 **{identified_sku}** 的产品。\n\n请重新搜索产品，或者指定一个可用的产品。"""
         else:
-            response_text = f"""❌ **Product Not Found**
-
-Sorry, I couldn't find a product with SKU **{identified_sku}** in the current search results.
-
-Please search for products again, or specify an available product."""
-        
+            response_text = f"""❌ **Product Not Found**\n\nSorry, I couldn't find a product with SKU **{identified_sku}** in the listing database.\n\nPlease search for products again, or specify an available product."""
         return {
             **state,
             "modified_images": [],

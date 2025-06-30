@@ -6,6 +6,7 @@ from io import BytesIO
 from typing import Dict, List, Any
 from datetime import datetime
 from langchain_openai import ChatOpenAI
+from langchain.schema import AIMessage
 
 def extract_text_from_multimodal_content(content):
     """Extract text content from multimodal messages, handling images properly."""
@@ -419,10 +420,10 @@ class ListingDatabase:
         
         return added_skus
 
-def parse_confirmation_intent(user_query: str) -> str:
+def parse_confirmation_intent(user_query: str) -> tuple:
     """
     Use LLM to classify the user's confirmation response after image modification.
-    Returns one of: add_only, add_and_list, skip_and_list, skip, clarify
+    Returns a tuple: (intent, followup_instruction)
     """
     print(f"🔍 Debug - parse_confirmation_intent:")
     print(f"   Input user_query: '{user_query}'")
@@ -455,20 +456,24 @@ ANALYZE ONLY this response and classify their intent:
 **clarify**: The intent is truly unclear or ambiguous
 - Examples: "maybe", "I don't know", "what do you think?", unclear responses
 
+**FOLLOW-UP INSTRUCTION**: If the user also requests another image modification (e.g., "generate another one of the same product in an outdoor vineyard"), extract the follow-up instruction as a string. If not, return null.
+
 **ANALYSIS RULES:**
 1. **Focus ONLY on the current response** - ignore any previous conversation
 2. **Look for positive words** - "ok", "good", "perfect", "可以", "不错" indicate satisfaction
 3. **Look for listing keywords** - "list", "publish", "上架", "shopify" indicate listing intent
 4. **Chinese responses** - "这个ok，把这款产品上架到shopify" = add_and_list (satisfied + wants to list)
 5. **Combination responses** - If user is satisfied AND wants to list = add_and_list
+6. **If the user also requests another image modification, extract the follow-up instruction.**
 
 **STEP-BY-STEP ANALYSIS:**
 1. Is the user satisfied with the image? (yes/no/ambiguous)
 2. Does the user want to list/publish the product? (yes/no/ambiguous)
-3. Based on answers, classify the intent.
+3. Does the user request another image modification? (yes/no, if yes, extract the instruction)
+4. Based on answers, classify the intent and extract follow-up instruction.
 
 Respond with a JSON object:
-{{"intent": "intent_type", "reasoning": "Detailed explanation of how you interpreted the user's response"}}
+{{"intent": "intent_type", "reasoning": "Detailed explanation of how you interpreted the user's response", "followup_instruction": "the follow-up image modification instruction, or null if none"}}
 """
     llm = ChatOpenAI(model="gpt-4o", temperature=0.1)
     response = llm.invoke(prompt)
@@ -482,11 +487,13 @@ Respond with a JSON object:
         result = json.loads(content)
         intent = result.get("intent", "clarify")
         reasoning = result.get("reasoning", "")
+        followup_instruction = result.get("followup_instruction", None)
         print(f"🤖 Intent parsing reasoning: {reasoning}")
-        return intent
+        print(f"🤖 Follow-up instruction: {followup_instruction}")
+        return intent, followup_instruction
     except Exception as e:
         print(f"❌ Error in intent parsing: {e}")
-        return "clarify"
+        return "clarify", None
 
 def listing_database_node(state):
     """
@@ -523,14 +530,18 @@ def listing_database_node(state):
         print(f"   user_query type: {type(user_query)}")
         print(f"   user_query length: {len(user_query)}")
         print(f"   awaiting_confirmation: {awaiting_confirmation}")
-        
-        intent = parse_confirmation_intent(user_query)
+        intent, followup_instruction = parse_confirmation_intent(user_query)
         print(f"🤖 Confirmation intent: {intent}")
+        response_text = None
+        ready_skus = db.list_products()
+        sku = None
+        if modified_images:
+            modification_result = modified_images[0]
+            sku = modification_result.get('sku')
+        # --- Existing intent handling logic ---
         if intent == "add_only":
             # Add to DB, prompt for next action
             if modified_images:
-                modification_result = modified_images[0]
-                sku = modification_result.get('sku')
                 if sku and modification_result.get('status') == 'success':
                     original_metadata = None
                     for product in search_results:
@@ -555,12 +566,9 @@ def listing_database_node(state):
             else:
                 response_text = """❌ **No Modified Images**\n\nNo modified images found to add to the database."""
             ready_skus = db.list_products()
-            return {**state, "listing_database_response": response_text, "listing_ready_products": ready_skus, "awaiting_confirmation": False}
         elif intent == "add_and_list":
             # Add to DB, then trigger Shopify agent
             if modified_images:
-                modification_result = modified_images[0]
-                sku = modification_result.get('sku')
                 if sku and modification_result.get('status') == 'success':
                     original_metadata = None
                     for product in search_results:
@@ -576,21 +584,35 @@ def listing_database_node(state):
                         )
             ready_skus = db.list_products()
             # Set a flag or action to trigger Shopify agent in the workflow
-            return {**state, "listing_database_response": "", "listing_ready_products": ready_skus, "awaiting_confirmation": False, "action_type": "shopify_agent"}
+            state["action_type"] = "shopify_agent"
+            response_text = ""
         elif intent == "skip_and_list":
             # Do not add, trigger Shopify agent
             ready_skus = db.list_products()
-            return {**state, "listing_database_response": "", "listing_ready_products": ready_skus, "awaiting_confirmation": False, "action_type": "shopify_agent"}
+            state["action_type"] = "shopify_agent"
+            response_text = ""
         elif intent == "skip":
             # Do not add, prompt for next action
             response_text = """❌ **Modification Discarded**\n\nThe image modification has been discarded. The original product images remain unchanged.\n\nYou can:\n- **Try a different modification** with a new instruction\n- **Search for other products** to modify\n- **List the original product** on Shopify"""
             ready_skus = db.list_products()
-            return {**state, "listing_database_response": response_text, "listing_ready_products": ready_skus, "awaiting_confirmation": False}
         else:
             # Clarify
             response_text = """🤔 **I'm not sure what you'd like to do**\n\nIf you've just modified an image, please respond with:\n- **\"Yes\"** to add it to the listing database\n- **\"No\"** to discard the modification\n- **\"Yes and list this\"** to add and list\n- **\"No, but go ahead and list\"** to skip adding and list\n\nOr you can:\n- **\"View all listing-ready products\"** to see what's ready\n- **\"Remove SKU\"** to remove a product from the database"""
             ready_skus = db.list_products()
-            return {**state, "listing_database_response": response_text, "listing_ready_products": ready_skus, "awaiting_confirmation": True}
+        # --- Always trigger follow-up if present ---
+        if followup_instruction and isinstance(followup_instruction, str) and followup_instruction.strip():
+            print(f"🔄 Detected follow-up image modification instruction: {followup_instruction}")
+            # Use the same SKU as the last modified product if available
+            state["image_modification_request"] = {
+                "instruction": followup_instruction,
+                "sku": sku
+            }
+            state["plan_action"] = "image_agent"
+        # Always append a new AIMessage for every user action
+        messages = state.get("messages", [])
+        if response_text:
+            messages = messages + [AIMessage(content=response_text)]
+        return {**state, "listing_database_response": response_text, "listing_ready_products": ready_skus, "awaiting_confirmation": False, "messages": messages}
     
     elif "view all listing" in user_query or "show listing" in user_query or "list ready" in user_query:
         # User wants to see all listing-ready products

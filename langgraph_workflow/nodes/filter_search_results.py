@@ -35,6 +35,10 @@ def filter_search_results_node(state):
         }
         product_summaries.append(summary)
 
+    # Debug: Show user query and number of search results
+    print(f"🔍 [Filter Node] User query: {user_query}")
+    print(f"🔍 [Filter Node] Number of search results: {len(search_results)}")
+
     llm = ChatOpenAI(model="gpt-4o", temperature=0.3, request_timeout=15)
     prompt = f"""
 You are an expert e-commerce assistant. The user wants to list a product on Shopify.
@@ -52,6 +56,20 @@ IMPORTANT: Pay close attention to the user's specific request. If they mention:
 - A specific material (like "rattan", "wood", "plastic"), select the product with that material
 - A specific type (like "chair", "table", "seating"), select the product matching that type
 - A specific SKU, select that exact product
+- if they say something broad like coffee shop items, winary items, be very lenient and forgiving on the selection
+
+**If multiple products are relevant, return all of them (up to 5).**
+
+EXAMPLES:
+- User: "List all black chairs and white tables"
+  Output: [
+    {"sku": "SKU123", "title": "Black Chair", "description": "A stylish black chair..."},
+    {"sku": "SKU456", "title": "White Table", "description": "A modern white table..."}
+  ]
+- User: "List the khaki chair"
+  Output: [
+    {"sku": "SKU789", "title": "Khaki Chair", "description": "A comfortable khaki chair..."}
+  ]
 
 1. Select the most relevant product(s) based on the user's instruction, the product details, and the last summary you gave.
 2. For each selected product, generate a compelling, human-friendly product title and a rich, persuasive product description suitable for Shopify.
@@ -59,10 +77,14 @@ IMPORTANT: Pay close attention to the user's specific request. If they mention:
 
 Format:
 [
-  {{"sku": ..., "title": ..., "description": ...}}, ...
+  {"sku": ..., "title": ..., "description": ...}, ...
 ]
 """
+    # Debug: Show the LLM prompt (truncated if long)
+    print(f"🔍 [Filter Node] LLM prompt (first 500 chars): {prompt[:500]}{'...' if len(prompt) > 500 else ''}")
     response = llm.invoke(prompt)
+    # Debug: Show the raw LLM response
+    print(f"🔍 [Filter Node] Raw LLM response: {getattr(response, 'content', str(response))[:500]}")
     try:
         content = response.content.strip()
         if content.startswith('```'):
@@ -77,8 +99,13 @@ Format:
                     json_lines.append(line)
             content = '\n'.join(json_lines)
         selected = json.loads(content)
-    except Exception:
+    except Exception as e:
+        print(f"❌ [Filter Node] Error parsing LLM response: {e}")
         selected = []
+
+    # Debug: Show parsed output
+    print(f"🔍 [Filter Node] Parsed selected products count: {len(selected)}")
+    print(f"🔍 [Filter Node] Parsed selected: {selected}")
 
     # Attach generated title/description to the selected products' metadata
     filtered_results = []
@@ -110,6 +137,7 @@ Format:
 
     # Fallback: if LLM returns nothing, use the top search result and generate title/description with LLM
     if not filtered_results and search_results:
+        print("🔍 [Filter Node] Triggering fallback to top search result.")
         match = search_results[0]
         meta = match.get('metadata', {})
         # Use LLM to generate a catchy title/description from metadata
@@ -136,6 +164,11 @@ Return a JSON object: {{"title": ..., "description": ...}}
         match['metadata'] = meta
         filtered_results = [match]
         print(f"🔍 Filter Node - Fallback to top product: SKU={meta.get('sku', '')}, Title={meta.get('title', '')}")
+
+    print(f"🔍 [Filter Node] Final filtered results count: {len(filtered_results)}")
+    for i, match in enumerate(filtered_results):
+        meta = match.get('metadata', {})
+        print(f"   {i}: SKU={meta.get('sku', '')}, Title={meta.get('title', '')}, Description={meta.get('description', '')}")
 
     return {
         **state,
